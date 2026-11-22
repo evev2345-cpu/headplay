@@ -17,6 +17,7 @@ const fsmStateEl = document.getElementById('fsmState') as HTMLElement;
 const earScoresEl = document.getElementById('earScores') as HTMLElement;
 const lastCommandEl = document.getElementById('lastCommand') as HTMLElement;
 const blinkSummaryEl = document.getElementById('blinkSummary') as HTMLElement;
+const lastBlinkStatEl = document.getElementById('lastBlinkStat') as HTMLElement;
 
 const pipelineMetaEl = document.getElementById('pipelineMeta') as HTMLElement;
 const fpsStatEl = document.getElementById('fpsStat') as HTMLElement;
@@ -69,8 +70,11 @@ function populateConfigForm(config: GestureConfig): void {
   setVal('headYawGateEnabled', config.headYawGateEnabled);
   setVal('maxFrameGapMs', config.maxFrameGapMs);
   setVal('stallThresholdMs', config.stallThresholdMs);
+  setVal('inputMaxWidth', config.inputMaxWidth);
+  setVal('targetFps', config.targetFps);
   setVal('captureMode', config.captureMode);
   setVal('delegatePreference', config.delegatePreference);
+  setVal('directVideoFrameGpu', config.directVideoFrameGpu);
   setVal('mirrorHorizontal', config.mirrorHorizontal);
   setVal('invertGazeDirection', config.invertGazeDirection);
 }
@@ -133,6 +137,7 @@ function renderStatus(status: BackgroundStatusResponse): void {
     fsmStateEl.textContent = '-';
     earScoresEl.textContent = 'EAR L:- R:-';
     blinkSummaryEl.textContent = '단일:0 | 긴감김:0 | 2연속:0 | 명령:0';
+    lastBlinkStatEl.textContent = '최근 깜빡임: closed - | openGap -';
     pipelineMetaEl.textContent = 'OFFSCREEN CLOSED';
     fpsStatEl.textContent = '-';
     dtAvgStatEl.textContent = '-';
@@ -153,16 +158,25 @@ function renderStatus(status: BackgroundStatusResponse): void {
   fsmStateEl.textContent = m.currentFsmState;
   earScoresEl.textContent = `EAR L:${fmt(m.earLeft)} R:${fmt(m.earRight)}`;
   blinkSummaryEl.textContent = `짧은:${m.blinkCounts.short} | 긴감김:${m.blinkCounts.long} | 2연속:${m.blinkCounts.doubleBlink} | 명령:${m.blinkCounts.commands}`;
+  lastBlinkStatEl.textContent = `최근 깜빡임: closed ${m.lastBlinkClosedMs !== null ? `${m.lastBlinkClosedMs}ms` : '-'} | openGap ${m.lastBlinkOpenGapMs !== null ? `${m.lastBlinkOpenGapMs}ms` : '-'}`;
 
-  pipelineMetaEl.textContent = `${m.captureMode} | ${m.activeDelegate}`;
-  fpsStatEl.textContent = `${m.rollingFps} / ${fmt(m.avgFps, 1)}`;
-  dtAvgStatEl.textContent = `${fmt(m.avgDtMs, 1)} / ${fmt(m.p95DtMs, 1)} ms`;
+  pipelineMetaEl.textContent = `${m.cameraResolution} | ${m.activeDelegate}`;
+  fpsStatEl.textContent = `${m.cameraInputFps} / ${m.rollingFps} (${fmt(m.avgFps, 1)})`;
+  dtAvgStatEl.textContent = `${fmt(m.avgCameraIntervalMs, 0)} / ${fmt(m.avgDtMs, 1)} (${fmt(m.p95DtMs, 0)})`;
   dtMaxStatEl.textContent = `${fmt(m.maxDtMs, 0)} ms / ${m.frameGapWarnings}회`;
   stallStatEl.textContent = m.activeStallOngoing
     ? `진행중(${m.activeStallDurationMs}ms) / 누적 ${m.totalStallMs}ms`
     : `${m.stallCount}회 / ${m.totalStallMs}ms (최대 ${m.maxStallMs}ms)`;
-  timingStatEl.textContent = `${fmt(m.avgBlitMs, 1)} / ${fmt(m.avgInferMs, 1)} ms`;
-  frameCountsEl.textContent = `${m.totalFrames} / ${m.droppedFrames}`;
+  timingStatEl.textContent = `${fmt(m.avgQueueDelayMs, 1)} / ${fmt(m.avgBlitMs, 1)} / ${fmt(m.avgInferMs, 1)}`;
+  const pathShort =
+    m.inputPath === 'video_frame_zero_copy'
+      ? 'ZC'
+      : m.inputPath === 'canvas_downscale'
+        ? 'CV'
+        : m.inputPath === 'timer_video_canvas'
+          ? 'TM'
+          : '?';
+  frameCountsEl.textContent = `${m.totalFrames} / ${m.droppedFrames} (${pathShort})`;
   currentMarkerEl.textContent = m.currentMarker;
 
   renderLogs(status.logs);
@@ -229,8 +243,11 @@ configForm.addEventListener('submit', (ev) => {
     headYawGateEnabled: (configForm.elements.namedItem('headYawGateEnabled') as HTMLInputElement).checked,
     maxFrameGapMs: num('maxFrameGapMs'),
     stallThresholdMs: num('stallThresholdMs'),
+    inputMaxWidth: num('inputMaxWidth'),
+    targetFps: num('targetFps'),
     captureMode: fd.get('captureMode') as CaptureMode,
     delegatePreference: fd.get('delegatePreference') as DelegatePreference,
+    directVideoFrameGpu: (configForm.elements.namedItem('directVideoFrameGpu') as HTMLInputElement).checked,
     mirrorHorizontal: (configForm.elements.namedItem('mirrorHorizontal') as HTMLInputElement).checked,
     invertGazeDirection: (configForm.elements.namedItem('invertGazeDirection') as HTMLInputElement).checked,
   };

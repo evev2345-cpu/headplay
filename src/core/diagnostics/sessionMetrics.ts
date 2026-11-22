@@ -24,9 +24,18 @@ export interface DiagnosticLogEntry {
   data?: Record<string, unknown>;
 }
 
+export type FrameInputPath =
+  | 'video_frame_zero_copy'
+  | 'canvas_downscale'
+  | 'timer_video_canvas'
+  | 'unknown';
+
 export interface FrameProcessingTiming {
+  queueDelayMs?: number;
   blitMs?: number;
   inferMs?: number;
+  totalProcessMs?: number;
+  inputPath?: FrameInputPath;
 }
 
 export interface SegmentMetricsSummary {
@@ -46,6 +55,11 @@ export interface SessionMetricsSnapshot {
   uptimeMs: number;
   captureMode: CaptureMode;
   activeDelegate: DelegatePreference | 'UNINITIALIZED';
+  cameraResolution: string;
+  inputPath: FrameInputPath;
+  cameraInputFrames: number;
+  cameraInputFps: number;
+  avgCameraIntervalMs: number;
   totalFrames: number;
   droppedFrames: number;
   faceDetectedFrames: number;
@@ -55,8 +69,10 @@ export interface SessionMetricsSnapshot {
   avgDtMs: number;
   maxDtMs: number;
   p95DtMs: number;
+  avgQueueDelayMs: number;
   avgBlitMs: number;
   avgInferMs: number;
+  avgProcessMs: number;
   frameGapWarnings: number;
   stallThresholdMs: number;
   stallCount: number;
@@ -76,6 +92,8 @@ export interface SessionMetricsSnapshot {
   gazeRawBlendshape: number | null;
   gazeRawIris: number | null;
   gazeSmoothed: number | null;
+  lastBlinkClosedMs: number | null;
+  lastBlinkOpenGapMs: number | null;
   currentMarker: string;
   blinkCounts: {
     short: number;
@@ -131,7 +149,15 @@ export class SessionMetrics {
 
   private captureMode: CaptureMode = 'track_processor';
   private activeDelegate: DelegatePreference | 'UNINITIALIZED' = 'UNINITIALIZED';
+  private cameraResolution = '-';
+  private inputPath: FrameInputPath = 'unknown';
   private stallThresholdMs = 1000;
+
+  private cameraInputFrames = 0;
+  private lastCameraArrivalMs: number | null = null;
+  private cameraIntervalSum = 0;
+  private cameraIntervalCount = 0;
+  private recentCameraTimestamps: number[] = [];
 
   private totalFrames = 0;
   private droppedFrames = 0;
@@ -150,10 +176,14 @@ export class SessionMetrics {
   private recentDts: number[] = [];
   private recentFrameTimestamps: number[] = [];
 
+  private queueDelaySum = 0;
+  private queueDelayCount = 0;
   private blitSum = 0;
   private blitCount = 0;
   private inferSum = 0;
   private inferCount = 0;
+  private processSum = 0;
+  private processCount = 0;
 
   private currentEyeState: EyeState = 'OPEN';
   private currentGazeDirection: GazeDirection = 'UNKNOWN';
@@ -169,6 +199,8 @@ export class SessionMetrics {
   private gazeRawBlendshape: number | null = null;
   private gazeRawIris: number | null = null;
   private gazeSmoothed: number | null = null;
+  private lastBlinkClosedMs: number | null = null;
+  private lastBlinkOpenGapMs: number | null = null;
 
   private currentMarker = 'FOREGROUND_POPUP';
   private blinkCounts = { short: 0, long: 0, doubleBlink: 0, commands: 0 };
@@ -180,6 +212,41 @@ export class SessionMetrics {
   setStallThresholdMs(ms: number): void {
     if (Number.isFinite(ms) && ms >= 400) {
       this.stallThresholdMs = Math.round(ms);
+    }
+  }
+
+  setCameraInfo(
+    resolution: string,
+    inputPath: FrameInputPath,
+    timestampMs?: number,
+    wallTimeMs = Date.now(),
+  ): void {
+    this.cameraResolution = resolution;
+    this.inputPath = inputPath;
+    if (timestampMs !== undefined) {
+      this.pushLog(
+        timestampMs,
+        'SESSION',
+        `Camera negotiated: ${resolution}, inputPath=${inputPath}`,
+        { resolution, inputPath },
+        wallTimeMs,
+      );
+    }
+  }
+
+  recordCameraArrival(arrivalPerfMs: number): void {
+    this.cameraInputFrames += 1;
+    if (this.lastCameraArrivalMs !== null && arrivalPerfMs >= this.lastCameraArrivalMs) {
+      this.cameraIntervalSum += arrivalPerfMs - this.lastCameraArrivalMs;
+      this.cameraIntervalCount += 1;
+    }
+    this.lastCameraArrivalMs = arrivalPerfMs;
+    this.recentCameraTimestamps.push(arrivalPerfMs);
+    while (
+      this.recentCameraTimestamps.length > 0 &&
+      arrivalPerfMs - (this.recentCameraTimestamps[0] ?? arrivalPerfMs) > FPS_WINDOW_MS
+    ) {
+      this.recentCameraTimestamps.shift();
     }
   }
 
@@ -218,6 +285,13 @@ export class SessionMetrics {
     this.startedAtPerfMs = null;
     this.lastPerfMs = null;
     this.lastWallMs = null;
+    this.cameraResolution = '-';
+    this.inputPath = 'unknown';
+    this.cameraInputFrames = 0;
+    this.lastCameraArrivalMs = null;
+    this.cameraIntervalSum = 0;
+    this.cameraIntervalCount = 0;
+    this.recentCameraTimestamps = [];
     this.totalFrames = 0;
     this.droppedFrames = 0;
     this.faceDetectedFrames = 0;
@@ -232,10 +306,14 @@ export class SessionMetrics {
     this.maxDtMs = 0;
     this.recentDts = [];
     this.recentFrameTimestamps = [];
+    this.queueDelaySum = 0;
+    this.queueDelayCount = 0;
     this.blitSum = 0;
     this.blitCount = 0;
     this.inferSum = 0;
     this.inferCount = 0;
+    this.processSum = 0;
+    this.processCount = 0;
     this.currentEyeState = 'OPEN';
     this.currentGazeDirection = 'UNKNOWN';
     this.currentFsmState = 'IDLE';
@@ -249,6 +327,8 @@ export class SessionMetrics {
     this.gazeRawBlendshape = null;
     this.gazeRawIris = null;
     this.gazeSmoothed = null;
+    this.lastBlinkClosedMs = null;
+    this.lastBlinkOpenGapMs = null;
     this.currentMarker = 'FOREGROUND_POPUP';
     this.blinkCounts = { short: 0, long: 0, doubleBlink: 0, commands: 0 };
     this.segments.clear();
@@ -353,16 +433,22 @@ export class SessionMetrics {
     this.pushLog(
       timestampMs,
       'SESSION',
-      `HEARTBEAT [${snap.currentMarker}]: fps=${snap.rollingFps}, avgFps=${snap.avgFps}, avgDt=${snap.avgDtMs}ms, maxDt=${snap.maxDtMs}ms, stalls=${snap.stallCount}(${snap.totalStallMs}ms), gaps=${snap.frameGapWarnings}`,
+      `HEARTBEAT [${snap.currentMarker}]: inFps=${snap.cameraInputFps}, fps=${snap.rollingFps}(avg=${snap.avgFps}), avgDt=${snap.avgDtMs}ms, q=${snap.avgQueueDelayMs}ms, blit=${snap.avgBlitMs}ms, infer=${snap.avgInferMs}ms, stalls=${snap.stallCount}(${snap.totalStallMs}ms)`,
       {
         marker: snap.currentMarker,
+        cameraResolution: snap.cameraResolution,
+        inputPath: snap.inputPath,
+        cameraInputFps: snap.cameraInputFps,
+        avgCameraIntervalMs: snap.avgCameraIntervalMs,
         rollingFps: snap.rollingFps,
         avgFps: snap.avgFps,
         avgDtMs: snap.avgDtMs,
         maxDtMs: snap.maxDtMs,
         p95DtMs: snap.p95DtMs,
+        avgQueueDelayMs: snap.avgQueueDelayMs,
         avgBlitMs: snap.avgBlitMs,
         avgInferMs: snap.avgInferMs,
+        avgProcessMs: snap.avgProcessMs,
         droppedFrames: snap.droppedFrames,
         frameGapWarnings: snap.frameGapWarnings,
         stallCount: snap.stallCount,
@@ -439,6 +525,10 @@ export class SessionMetrics {
       this.faceDetectedFrames += 1;
     }
 
+    if (timing?.queueDelayMs !== undefined && Number.isFinite(timing.queueDelayMs)) {
+      this.queueDelaySum += timing.queueDelayMs;
+      this.queueDelayCount += 1;
+    }
     if (timing?.blitMs !== undefined && Number.isFinite(timing.blitMs)) {
       this.blitSum += timing.blitMs;
       this.blitCount += 1;
@@ -446,6 +536,13 @@ export class SessionMetrics {
     if (timing?.inferMs !== undefined && Number.isFinite(timing.inferMs)) {
       this.inferSum += timing.inferMs;
       this.inferCount += 1;
+    }
+    if (timing?.totalProcessMs !== undefined && Number.isFinite(timing.totalProcessMs)) {
+      this.processSum += timing.totalProcessMs;
+      this.processCount += 1;
+    }
+    if (timing?.inputPath) {
+      this.inputPath = timing.inputPath;
     }
 
     this.lastPerfMs = now;
@@ -495,31 +592,45 @@ export class SessionMetrics {
 
     for (const ev of events) {
       switch (ev.type) {
-        case 'BLINK_MEASURED':
+        case 'BLINK_MEASURED': {
           if (ev.classification === 'SHORT') this.blinkCounts.short += 1;
           if (ev.classification === 'LONG') this.blinkCounts.long += 1;
+          const closedMs = Math.round(ev.closedDurationMs);
+          const openGapMs = ev.openGapMs !== null ? Math.round(ev.openGapMs) : null;
+          this.lastBlinkClosedMs = closedMs;
+          this.lastBlinkOpenGapMs = openGapMs;
+          const valleyTag = ev.suspectedMissedOpenValley ? ' [VALLEY_SUSPECTED]' : '';
           this.pushLog(
             ev.timestampMs,
             'BLINK',
-            `Blink #${ev.blinkIndex}: ${Math.round(ev.durationMs)}ms [${ev.classification}]`,
+            `Blink #${ev.blinkIndex}: closed=${closedMs}ms, openGap=${openGapMs !== null ? `${openGapMs}ms` : 'n/a'}, frames=${ev.frameCount}, maxDt=${ev.maxDtDuringCloseMs}ms, blinkAvg=[${ev.minBlinkAvgDuringClose.toFixed(2)}..${ev.peakBlinkAvgDuringClose.toFixed(2)}] [${ev.classification}]${valleyTag}`,
             {
               blinkIndex: ev.blinkIndex,
-              durationMs: Math.round(ev.durationMs),
+              durationMs: closedMs,
+              closedDurationMs: closedMs,
+              openGapMs,
+              frameCount: ev.frameCount,
+              maxDtDuringCloseMs: ev.maxDtDuringCloseMs,
+              minBlinkAvgDuringClose: ev.minBlinkAvgDuringClose,
+              peakBlinkAvgDuringClose: ev.peakBlinkAvgDuringClose,
+              suspectedMissedOpenValley: ev.suspectedMissedOpenValley,
               classification: ev.classification,
               marker: this.currentMarker,
             },
             wallTimeMs,
           );
           break;
+        }
         case 'DOUBLE_BLINK_DETECTED':
           this.blinkCounts.doubleBlink += 1;
           this.pushLog(
             ev.timestampMs,
             'DOUBLE_BLINK',
-            `Double blink detected (b1=${Math.round(ev.blink1Ms)}ms, gap=${Math.round(ev.gapMs)}ms, b2=${Math.round(ev.blink2Ms)}ms)`,
+            `Double blink detected (b1=${Math.round(ev.blink1Ms)}ms, openGap=${Math.round(ev.gapMs)}ms, b2=${Math.round(ev.blink2Ms)}ms)`,
             {
               blink1Ms: Math.round(ev.blink1Ms),
               gapMs: Math.round(ev.gapMs),
+              openGapMs: Math.round(ev.gapMs),
               blink2Ms: Math.round(ev.blink2Ms),
               marker: this.currentMarker,
             },
@@ -580,9 +691,13 @@ export class SessionMetrics {
     const uptimeMs = this.startedAtPerfMs !== null ? Math.max(0, refNow - this.startedAtPerfMs) : 0;
     const avgFps = uptimeMs > 0 ? (this.totalFrames * 1000) / uptimeMs : 0;
     const avgDtMs = this.dtCount > 0 ? this.dtSum / this.dtCount : 0;
+    const avgCameraIntervalMs =
+      this.cameraIntervalCount > 0 ? this.cameraIntervalSum / this.cameraIntervalCount : 0;
     const p95DtMs = computePercentile(this.recentDts, 0.95);
+    const avgQueueDelayMs = this.queueDelayCount > 0 ? this.queueDelaySum / this.queueDelayCount : 0;
     const avgBlitMs = this.blitCount > 0 ? this.blitSum / this.blitCount : 0;
     const avgInferMs = this.inferCount > 0 ? this.inferSum / this.inferCount : 0;
+    const avgProcessMs = this.processCount > 0 ? this.processSum / this.processCount : 0;
 
     let activeStallDurationMs = 0;
     if (this.activeStall && nowPerfMs !== undefined) {
@@ -611,6 +726,11 @@ export class SessionMetrics {
       uptimeMs: Math.round(uptimeMs),
       captureMode: this.captureMode,
       activeDelegate: this.activeDelegate,
+      cameraResolution: this.cameraResolution,
+      inputPath: this.inputPath,
+      cameraInputFrames: this.cameraInputFrames,
+      cameraInputFps: this.recentCameraTimestamps.length,
+      avgCameraIntervalMs: round2(avgCameraIntervalMs),
       totalFrames: this.totalFrames,
       droppedFrames: this.droppedFrames,
       faceDetectedFrames: this.faceDetectedFrames,
@@ -620,8 +740,10 @@ export class SessionMetrics {
       avgDtMs: round2(avgDtMs),
       maxDtMs: round2(this.maxDtMs),
       p95DtMs: round2(p95DtMs),
+      avgQueueDelayMs: round2(avgQueueDelayMs),
       avgBlitMs: round2(avgBlitMs),
       avgInferMs: round2(avgInferMs),
+      avgProcessMs: round2(avgProcessMs),
       frameGapWarnings: this.frameGapWarnings,
       stallThresholdMs: this.stallThresholdMs,
       stallCount: this.stallCount,
@@ -641,6 +763,8 @@ export class SessionMetrics {
       gazeRawBlendshape: this.gazeRawBlendshape !== null ? round3(this.gazeRawBlendshape) : null,
       gazeRawIris: this.gazeRawIris !== null ? round3(this.gazeRawIris) : null,
       gazeSmoothed: this.gazeSmoothed !== null ? round3(this.gazeSmoothed) : null,
+      lastBlinkClosedMs: this.lastBlinkClosedMs,
+      lastBlinkOpenGapMs: this.lastBlinkOpenGapMs,
       currentMarker: this.currentMarker,
       blinkCounts: { ...this.blinkCounts },
       segmentStats,

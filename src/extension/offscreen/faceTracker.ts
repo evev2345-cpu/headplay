@@ -69,9 +69,13 @@ export class FaceTracker {
   }
 
   detect(
-    canvas: HTMLCanvasElement,
+    source: TexImageSource,
     timestampMs: number,
-    onFallbackToCpu?: (err: unknown) => void,
+    options?: {
+      isDirectVideoFrame?: boolean;
+      onDirectVideoFrameUnsupported?: (err: unknown) => void;
+      onFallbackToCpu?: (err: unknown) => void;
+    },
   ): FaceDetectResult {
     if (!this.landmarker || this.switchingToCpu) {
       return { frame: { timestampMs, faceDetected: false }, inferMs: 0 };
@@ -83,7 +87,7 @@ export class FaceTracker {
 
     const inferStart = performance.now();
     try {
-      const result = this.landmarker.detectForVideo(canvas, safeTs);
+      const result = this.landmarker.detectForVideo(source, safeTs);
       const inferMs = performance.now() - inferStart;
       const landmarks = result.faceLandmarks?.[0];
       const blendshapes = result.faceBlendshapes?.[0]?.categories;
@@ -105,6 +109,14 @@ export class FaceTracker {
       };
     } catch (err) {
       const inferMs = performance.now() - inferStart;
+
+      // If direct VideoFrame input fails on a driver/GPU, switch to canvas blit first before abandoning GPU.
+      if (options?.isDirectVideoFrame && options.onDirectVideoFrameUnsupported) {
+        console.warn('[HEADPLAY][FaceTracker] Direct VideoFrame failed; falling back to canvas copy:', err);
+        options.onDirectVideoFrameUnsupported(err);
+        return { frame: { timestampMs, faceDetected: false }, inferMs };
+      }
+
       // If GPU/WebGL fails mid-session (e.g. context lost on minimize), trigger async CPU fallback.
       if (this.activeDelegate === 'GPU' && !this.switchingToCpu) {
         this.switchingToCpu = true;
@@ -112,7 +124,7 @@ export class FaceTracker {
         void this.init('CPU')
           .then(() => {
             this.switchingToCpu = false;
-            onFallbackToCpu?.(err);
+            options?.onFallbackToCpu?.(err);
           })
           .catch((fallbackErr) => {
             this.switchingToCpu = false;

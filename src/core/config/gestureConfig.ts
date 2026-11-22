@@ -42,6 +42,8 @@ export interface GestureConfig {
   captureMode: CaptureMode;
   delegatePreference: DelegatePreference;
   targetFps: number;
+  inputMaxWidth: number;
+  directVideoFrameGpu: boolean;
 }
 
 export const DEFAULT_GESTURE_CONFIG: Readonly<GestureConfig> = Object.freeze({
@@ -76,7 +78,9 @@ export const DEFAULT_GESTURE_CONFIG: Readonly<GestureConfig> = Object.freeze({
 
   captureMode: 'track_processor',
   delegatePreference: 'GPU',
-  targetFps: 25,
+  targetFps: 30,
+  inputMaxWidth: 320,
+  directVideoFrameGpu: true,
 });
 
 function clamp(value: number, min: number, max: number): number {
@@ -164,6 +168,7 @@ export function sanitizeGestureConfig(partial?: Partial<GestureConfig>): Gesture
       : d.delegatePreference;
 
   const targetFps = clamp(finiteOr(input.targetFps, d.targetFps), 10, 30);
+  const inputMaxWidth = Math.round(clamp(finiteOr(input.inputMaxWidth, d.inputMaxWidth), 160, 640));
 
   return {
     blinkCloseThreshold,
@@ -194,5 +199,8 @@ export function sanitizeGestureConfig(partial?: Partial<GestureConfig>): Gesture
     captureMode,
     delegatePreference,
     targetFps,
+    inputMaxWidth,
+    directVideoFrameGpu:
+      typeof input.directVideoFrameGpu === 'boolean' ? input.directVideoFrameGpu : d.directVideoFrameGpu,
   };
 }

@@ -88,26 +88,62 @@ async function startTracking(nextConfig: GestureConfig): Promise<{ ok: boolean; 
     metrics.setStallThresholdMs(config.stallThresholdMs);
 
     const initResult = await tracker.init(config.delegatePreference);
+    const preferDirectVideoFrame =
+      initResult.activeDelegate === 'GPU' && config.directVideoFrameGpu;
 
-    const activeMode = await capture.start(
+    const startTs = performance.now();
+    lastHeartbeatMs = startTs;
+    metrics.startSession(
+      startTs,
+      config.captureMode,
+      initResult.activeDelegate,
+      Date.now(),
+      config.stallThresholdMs,
+    );
+    if (initResult.fellBackToCpu) {
+      metrics.recordError('GPU delegate unavailable at startup; using CPU delegate', startTs);
+    }
+
+    const startResult = await capture.start(
       {
         mode: config.captureMode,
         targetFps: config.targetFps,
+        inputMaxWidth: config.inputMaxWidth,
         // Use CPU-optimized 2D canvas readback only when MediaPipe runs on CPU delegate.
         willReadFrequently: initResult.activeDelegate === 'CPU',
+        preferDirectVideoFrame,
       },
       {
-        onFrame: ({ canvas, timestampMs, blitMs }) => {
-          const { frame: rawFrame, inferMs } = tracker.detect(canvas, timestampMs, () => {
-            capture.setWillReadFrequently(true);
-            metrics.setActiveDelegate('CPU', timestampMs);
+        onCameraArrival: (arrivalMs) => {
+          metrics.recordCameraArrival(arrivalMs);
+        },
+        onFrame: ({ source, isDirectVideoFrame, inputPath, timestampMs, queueDelayMs, blitMs }) => {
+          const procStart = performance.now();
+          const { frame: rawFrame, inferMs } = tracker.detect(source, timestampMs, {
+            isDirectVideoFrame,
+            onDirectVideoFrameUnsupported: () => {
+              capture.setPreferDirectVideoFrame(false);
+              metrics.recordError(
+                'Direct VideoFrame input unsupported on this GPU; switched to canvas copy',
+                timestampMs,
+              );
+            },
+            onFallbackToCpu: () => {
+              capture.setPreferDirectVideoFrame(false);
+              capture.setWillReadFrequently(true);
+              metrics.setActiveDelegate('CPU', timestampMs);
+            },
           });
 
           const obs = extractor.extract(rawFrame);
           const fsmResult = fsm.update(obs);
+          const totalProcessMs = blitMs + (performance.now() - procStart);
           metrics.recordFrame(obs, fsmResult.state, fsmResult.events, Date.now(), {
+            queueDelayMs,
             blitMs,
             inferMs,
+            totalProcessMs,
+            inputPath,
           });
 
           // Periodic diagnostic heartbeat to verify continuity while Chrome is minimized.
@@ -155,18 +191,19 @@ async function startTracking(nextConfig: GestureConfig): Promise<{ ok: boolean; 
       },
     );
 
-    const startTs = performance.now();
-    lastHeartbeatMs = startTs;
-    metrics.startSession(startTs, activeMode, initResult.activeDelegate, Date.now(), config.stallThresholdMs);
-    if (initResult.fellBackToCpu) {
-      metrics.recordError('GPU delegate unavailable at startup; using CPU delegate', startTs);
-    }
+    const initialInputPath =
+      startResult.activeMode === 'timer_fallback'
+        ? 'timer_video_canvas'
+        : preferDirectVideoFrame && startResult.negotiatedWidth <= config.inputMaxWidth
+          ? 'video_frame_zero_copy'
+          : 'canvas_downscale';
+    metrics.setCameraInfo(startResult.resolutionLabel, initialInputPath, performance.now());
     startWatchdog();
 
     notifyBackground({
       target: 'background',
       type: 'OFFSCREEN_TRACKING_STARTED',
-      captureMode: activeMode,
+      captureMode: startResult.activeMode,
       activeDelegate: initResult.activeDelegate,
     });
 
@@ -230,6 +267,10 @@ chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse) => {
       extractor.updateConfig(config);
       fsm.updateConfig(config);
       capture.updateTargetFps(config.targetFps);
+      capture.setInputMaxWidth(config.inputMaxWidth);
+      capture.setPreferDirectVideoFrame(
+        tracker.getActiveDelegate() === 'GPU' && config.directVideoFrameGpu,
+      );
       metrics.setStallThresholdMs(config.stallThresholdMs);
       sendResponse({ ok: true });
       return false;

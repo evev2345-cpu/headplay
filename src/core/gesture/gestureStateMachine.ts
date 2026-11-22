@@ -26,6 +26,13 @@ export type GestureEvent =
       type: 'BLINK_MEASURED';
       timestampMs: number;
       durationMs: number;
+      closedDurationMs: number;
+      openGapMs: number | null;
+      frameCount: number;
+      maxDtDuringCloseMs: number;
+      minBlinkAvgDuringClose: number;
+      peakBlinkAvgDuringClose: number;
+      suspectedMissedOpenValley: boolean;
       classification: BlinkClassification;
       blinkIndex: 1 | 2;
     }
@@ -64,6 +71,17 @@ export interface GestureUpdateResult {
   snapshot: GestureStateSnapshot;
 }
 
+interface ActiveClosureTelemetry {
+  openGapMs: number | null;
+  frameCount: number;
+  maxDtDuringCloseMs: number;
+  peakBlinkAvg: number;
+  minBlinkAvg: number;
+  preValleyPeak: number;
+  valleyMin: number;
+  suspectedMissedOpenValley: boolean;
+}
+
 /**
  * Deterministic time-based Finite State Machine for HEADPLAY eye gestures.
  * All time progression relies strictly on observation.timestampMs for testability.
@@ -73,6 +91,7 @@ export class GestureStateMachine {
   private state: GestureFsmState = 'IDLE';
 
   private lastTimestampMs: number | null = null;
+  private lastFrameDtMs = 0;
   private faceLostSinceMs: number | null = null;
 
   private close1StartMs: number | null = null;
@@ -80,6 +99,8 @@ export class GestureStateMachine {
   private open1StartMs: number | null = null;
   private close2StartMs: number | null = null;
   private blinkGapMs: number | null = null;
+  private lastBlinkEndedMs: number | null = null;
+  private activeClosure: ActiveClosureTelemetry | null = null;
 
   private armedStartMs: number | null = null;
   private gazeHoldDir: 'LEFT' | 'RIGHT' | null = null;
@@ -106,7 +127,9 @@ export class GestureStateMachine {
   reset(): void {
     this.state = 'IDLE';
     this.lastTimestampMs = null;
+    this.lastFrameDtMs = 0;
     this.faceLostSinceMs = null;
+    this.lastBlinkEndedMs = null;
     this.clearTimingState();
     this.awaitingOpenAfterLongClose = false;
   }
@@ -117,10 +140,80 @@ export class GestureStateMachine {
     this.open1StartMs = null;
     this.close2StartMs = null;
     this.blinkGapMs = null;
+    this.activeClosure = null;
     this.armedStartMs = null;
     this.gazeHoldDir = null;
     this.gazeHoldStartMs = null;
     this.cooldownStartMs = null;
+  }
+
+  private beginClosureTelemetry(obs: EyeObservation): void {
+    const blinkAvg = (obs.blinkLeft + obs.blinkRight) / 2;
+    const openGapMs =
+      this.lastBlinkEndedMs !== null ? Math.max(0, obs.timestampMs - this.lastBlinkEndedMs) : null;
+    this.activeClosure = {
+      openGapMs,
+      frameCount: 1,
+      maxDtDuringCloseMs: this.lastFrameDtMs,
+      peakBlinkAvg: blinkAvg,
+      minBlinkAvg: blinkAvg,
+      preValleyPeak: blinkAvg,
+      valleyMin: blinkAvg,
+      suspectedMissedOpenValley: false,
+    };
+  }
+
+  private updateClosureTelemetry(obs: EyeObservation): void {
+    if (!this.activeClosure) {
+      this.beginClosureTelemetry(obs);
+      return;
+    }
+    const c = this.activeClosure;
+    const blinkAvg = (obs.blinkLeft + obs.blinkRight) / 2;
+    c.frameCount += 1;
+    if (this.lastFrameDtMs > c.maxDtDuringCloseMs) {
+      c.maxDtDuringCloseMs = this.lastFrameDtMs;
+    }
+    if (blinkAvg > c.peakBlinkAvg) c.peakBlinkAvg = blinkAvg;
+    if (blinkAvg < c.minBlinkAvg) c.minBlinkAvg = blinkAvg;
+
+    // Detect W-shaped valley (peak -> drop >= 0.18 -> rise >= 0.14) inside a single CLOSED interval,
+    // indicating a likely missed OPEN dip between two rapid short blinks.
+    if (!c.suspectedMissedOpenValley) {
+      if (blinkAvg > c.preValleyPeak && c.preValleyPeak - c.valleyMin < 0.18) {
+        c.preValleyPeak = blinkAvg;
+        c.valleyMin = blinkAvg;
+      } else if (blinkAvg < c.valleyMin) {
+        c.valleyMin = blinkAvg;
+      } else if (c.preValleyPeak - c.valleyMin >= 0.18 && blinkAvg - c.valleyMin >= 0.14) {
+        c.suspectedMissedOpenValley = true;
+      }
+    }
+  }
+
+  private makeBlinkMeasuredEvent(
+    timestampMs: number,
+    durationMs: number,
+    classification: BlinkClassification,
+    blinkIndex: 1 | 2,
+  ): Extract<GestureEvent, { type: 'BLINK_MEASURED' }> {
+    const c = this.activeClosure;
+    return {
+      type: 'BLINK_MEASURED',
+      timestampMs,
+      durationMs,
+      closedDurationMs: durationMs,
+      openGapMs: c ? c.openGapMs : null,
+      frameCount: c ? c.frameCount : 1,
+      maxDtDuringCloseMs: Math.round(
+        Math.max(c ? c.maxDtDuringCloseMs : 0, this.lastFrameDtMs),
+      ),
+      minBlinkAvgDuringClose: c ? Math.round(c.minBlinkAvg * 1000) / 1000 : 0,
+      peakBlinkAvgDuringClose: c ? Math.round(c.peakBlinkAvg * 1000) / 1000 : 0,
+      suspectedMissedOpenValley: c ? c.suspectedMissedOpenValley : false,
+      classification,
+      blinkIndex,
+    };
   }
 
   update(obs: EyeObservation): GestureUpdateResult {
@@ -136,6 +229,7 @@ export class GestureStateMachine {
     // blink durations can be inflated into false long-blinks. Reset any in-progress sequence.
     if (this.lastTimestampMs !== null) {
       const dt = now - this.lastTimestampMs;
+      this.lastFrameDtMs = dt;
       if (dt > this.config.maxFrameGapMs) {
         const prevState = this.state;
         events.push({
@@ -154,6 +248,8 @@ export class GestureStateMachine {
         this.lastTimestampMs = now;
         return { state: this.state, events, snapshot: this.buildSnapshot(now) };
       }
+    } else {
+      this.lastFrameDtMs = 0;
     }
     this.lastTimestampMs = now;
 
@@ -177,6 +273,7 @@ export class GestureStateMachine {
     if (this.awaitingOpenAfterLongClose) {
       if (obs.eyeState === 'OPEN') {
         this.awaitingOpenAfterLongClose = false;
+        this.lastBlinkEndedMs = now;
       } else {
         return { state: this.state, events, snapshot: this.buildSnapshot(now) };
       }
@@ -213,6 +310,7 @@ export class GestureStateMachine {
   private handleIdle(obs: EyeObservation, events: GestureEvent[]): void {
     if (obs.eyeState === 'CLOSED') {
       this.close1StartMs = obs.timestampMs;
+      this.beginClosureTelemetry(obs);
       this.transition('EYE_CLOSED_1', obs.timestampMs, 'eyes_closed', events);
     }
   }
@@ -224,14 +322,9 @@ export class GestureStateMachine {
 
     // Exceeded maximum long-blink duration while still closed (resting/sleeping eyes).
     if (obs.eyeState === 'CLOSED') {
+      this.updateClosureTelemetry(obs);
       if (duration > this.config.longBlinkMaxMs) {
-        events.push({
-          type: 'BLINK_MEASURED',
-          timestampMs: now,
-          durationMs: duration,
-          classification: 'TOO_LONG',
-          blinkIndex: 1,
-        });
+        events.push(this.makeBlinkMeasuredEvent(now, duration, 'TOO_LONG', 1));
         this.awaitingOpenAfterLongClose = true;
         this.clearTimingState();
         this.transition('IDLE', now, 'long_close_exceeded_max', events, duration);
@@ -241,13 +334,9 @@ export class GestureStateMachine {
 
     // Eyes opened: classify duration
     const classification = this.classifyBlinkDuration(duration);
-    events.push({
-      type: 'BLINK_MEASURED',
-      timestampMs: now,
-      durationMs: duration,
-      classification,
-      blinkIndex: 1,
-    });
+    const measured = this.makeBlinkMeasuredEvent(now, duration, classification, 1);
+    events.push(measured);
+    this.lastBlinkEndedMs = now;
 
     switch (classification) {
       case 'NOISE':
@@ -257,6 +346,7 @@ export class GestureStateMachine {
       case 'SHORT':
         this.blink1DurationMs = duration;
         this.open1StartMs = now;
+        this.activeClosure = null;
         this.transition('WAIT_SECOND_BLINK', now, 'short_blink1_detected', events, duration);
         break;
       case 'GUARD_BAND':
@@ -268,7 +358,13 @@ export class GestureStateMachine {
           type: 'GESTURE_COMMAND',
           timestampMs: now,
           command: 'TOGGLE_PLAY_PAUSE',
-          details: { durationMs: Math.round(duration) },
+          details: {
+            durationMs: Math.round(duration),
+            closedDurationMs: Math.round(duration),
+            frameCount: measured.frameCount,
+            maxDtDuringCloseMs: measured.maxDtDuringCloseMs,
+            suspectedMissedOpenValley: measured.suspectedMissedOpenValley ? 'true' : 'false',
+          },
         });
         this.clearTimingState();
         this.cooldownStartMs = now;
@@ -295,6 +391,7 @@ export class GestureStateMachine {
     if (obs.eyeState === 'CLOSED' && gap >= this.config.doubleBlinkGapMinMs) {
       this.blinkGapMs = gap;
       this.close2StartMs = now;
+      this.beginClosureTelemetry(obs);
       this.transition('EYE_CLOSED_2', now, 'second_blink_started', events, gap);
     }
   }
@@ -305,14 +402,16 @@ export class GestureStateMachine {
     const duration = now - start;
 
     if (obs.eyeState === 'CLOSED') {
+      this.updateClosureTelemetry(obs);
       if (duration > this.config.maxShortBlinkMs) {
-        events.push({
-          type: 'BLINK_MEASURED',
-          timestampMs: now,
-          durationMs: duration,
-          classification: duration > this.config.longBlinkMaxMs ? 'TOO_LONG' : 'GUARD_BAND',
-          blinkIndex: 2,
-        });
+        events.push(
+          this.makeBlinkMeasuredEvent(
+            now,
+            duration,
+            duration > this.config.longBlinkMaxMs ? 'TOO_LONG' : 'GUARD_BAND',
+            2,
+          ),
+        );
         this.awaitingOpenAfterLongClose = true;
         this.clearTimingState();
         this.transition('IDLE', now, 'blink2_exceeded_short_max', events, duration);
@@ -321,13 +420,8 @@ export class GestureStateMachine {
     }
 
     const classification = this.classifyBlinkDuration(duration);
-    events.push({
-      type: 'BLINK_MEASURED',
-      timestampMs: now,
-      durationMs: duration,
-      classification,
-      blinkIndex: 2,
-    });
+    events.push(this.makeBlinkMeasuredEvent(now, duration, classification, 2));
+    this.lastBlinkEndedMs = now;
 
     if (classification === 'SHORT') {
       const blink1Ms = this.blink1DurationMs ?? 0;
@@ -340,6 +434,7 @@ export class GestureStateMachine {
         blink2Ms: duration,
       });
       this.armedStartMs = now;
+      this.activeClosure = null;
       this.gazeHoldDir = null;
       this.gazeHoldStartMs = null;
       this.transition('ARMED_GAZE', now, 'double_blink_confirmed', events, duration);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { GestureEvent, GestureStateMachine } from '../../src/core/gesture/gestureStateMachine';
+import { EyeFeatureExtractor } from '../../src/core/vision/eyeFeatureExtractor';
 import { EyeObservation, EyeState, GazeDirection } from '../../src/core/vision/types';
 
 function makeObs(
@@ -315,5 +316,127 @@ describe('GestureStateMachine', () => {
     const seg = feedSegment(fsm, 80, 400, 40, 'OPEN', 'UNKNOWN', false);
     expect(seg.events.filter((e) => e.type === 'GESTURE_COMMAND')).toHaveLength(0);
     expect(fsm.getState()).toBe('IDLE');
+  });
+
+  it('never misclassifies rapid consecutive short blinks as LONG_BLINK when OPEN gaps are sampled (20 FPS)', () => {
+    const fsm = new GestureStateMachine();
+    const events: GestureEvent[] = [];
+
+    // 4 rapid short blinks: 150ms closed, 100ms open gap, sampled at 20 FPS (dt = 50ms)
+    let t = 0;
+    ({ endMs: t } = feedSegment(fsm, t, 100, 50, 'OPEN', 'CENTER'));
+    for (let i = 0; i < 4; i++) {
+      const closed = feedSegment(fsm, t, 150, 50, 'CLOSED');
+      events.push(...closed.events);
+      t = closed.endMs;
+
+      const open = feedSegment(fsm, t, 100, 50, 'OPEN', 'CENTER');
+      events.push(...open.events);
+      t = open.endMs;
+    }
+
+    const blinkEvents = events.filter(
+      (e): e is Extract<GestureEvent, { type: 'BLINK_MEASURED' }> => e.type === 'BLINK_MEASURED',
+    );
+    expect(blinkEvents.length).toBeGreaterThanOrEqual(2);
+    expect(blinkEvents[0]?.closedDurationMs).toBe(150);
+    expect(blinkEvents[0]?.openGapMs).toBeNull();
+    expect(blinkEvents[1]?.closedDurationMs).toBe(150);
+    expect(blinkEvents[1]?.openGapMs).toBe(100);
+
+    // Must never misclassify separated short blinks as LONG_BLINK (TOGGLE_PLAY_PAUSE)
+    const longCmds = events.filter(
+      (e) => e.type === 'GESTURE_COMMAND' && e.command === 'TOGGLE_PLAY_PAUSE',
+    );
+    expect(longCmds).toHaveLength(0);
+    expect(events.some((e) => e.type === 'DOUBLE_BLINK_DETECTED')).toBe(true);
+  });
+
+  it('reproduces how 8.3 FPS (120ms dt) misses a 100ms OPEN gap between rapid blinks while 20 FPS detects it', () => {
+    // Underlying continuous blink waveform for two rapid short blinks separated by a 100ms open gap:
+    // Blink 1: [100, 260]ms (160ms), Open gap: (260, 360)ms (100ms), Blink 2: [360, 520]ms (160ms)
+    const blinkScoreAt = (ms: number): number => {
+      if (ms >= 100 && ms <= 260) return 0.82;
+      if (ms >= 360 && ms <= 520) return 0.84;
+      return 0.08;
+    };
+
+    const runAtInterval = (dtMs: number, startPhaseMs: number) => {
+      const extractor = new EyeFeatureExtractor();
+      const fsm = new GestureStateMachine();
+      const events: GestureEvent[] = [];
+
+      for (let t = startPhaseMs; t <= 760; t += dtMs) {
+        const s = blinkScoreAt(t);
+        const obs = extractor.extract({
+          timestampMs: t,
+          faceDetected: true,
+          blendshapes: [
+            { categoryName: 'eyeBlinkLeft', score: s },
+            { categoryName: 'eyeBlinkRight', score: s },
+          ],
+        });
+        events.push(...fsm.update(obs).events);
+      }
+      return events;
+    };
+
+    // At 20 FPS (dt = 50ms), intermediate OPEN frames at t=300,350 are captured -> DOUBLE_BLINK, NO LONG_BLINK
+    const events20fps = runAtInterval(50, 0);
+    expect(events20fps.some((e) => e.type === 'DOUBLE_BLINK_DETECTED')).toBe(true);
+    expect(
+      events20fps.filter((e) => e.type === 'GESTURE_COMMAND' && e.command === 'TOGGLE_PLAY_PAUSE'),
+    ).toHaveLength(0);
+
+    // At 8.3 FPS (dt = 120ms, sampled at t=20, 140, 260, 380, 500, 620), the (260, 360) open gap
+    // falls completely between t=260 and t=380 -> intermediate OPEN is missed -> merged 480ms LONG_BLINK!
+    const events8fps = runAtInterval(120, 20);
+    const mergedLong = events8fps.find(
+      (e): e is Extract<GestureEvent, { type: 'BLINK_MEASURED' }> =>
+        e.type === 'BLINK_MEASURED' && e.classification === 'LONG',
+    );
+    expect(mergedLong).toBeDefined();
+    expect(mergedLong?.maxDtDuringCloseMs).toBe(120);
+    expect(
+      events8fps.some((e) => e.type === 'GESTURE_COMMAND' && e.command === 'TOGGLE_PLAY_PAUSE'),
+    ).toBe(true);
+  });
+
+  it('flags suspectedMissedOpenValley when blink score dips mid-closure without crossing blinkOpenThreshold', () => {
+    const extractor = new EyeFeatureExtractor({
+      blinkCloseThreshold: 0.55,
+      blinkOpenThreshold: 0.35,
+    });
+    const fsm = new GestureStateMachine();
+    const events: GestureEvent[] = [];
+
+    // Partial-reopen valley (0.39 > 0.35) between two rapid blink peaks (0.85 -> 0.39 -> 0.84)
+    const scores = [
+      0.05, 0.05, // open
+      0.75, 0.85, 0.82, // blink 1 peak
+      0.42, 0.39, 0.44, // partial reopen valley (misses 0.35 open threshold)
+      0.78, 0.84, 0.8, 0.72, 0.6, // blink 2 peak
+      0.1, 0.08, // open (total closed ~ 11 * 50ms = 550ms)
+    ];
+
+    scores.forEach((score, idx) => {
+      const obs = extractor.extract({
+        timestampMs: idx * 50,
+        faceDetected: true,
+        blendshapes: [
+          { categoryName: 'eyeBlinkLeft', score },
+          { categoryName: 'eyeBlinkRight', score },
+        ],
+      });
+      events.push(...fsm.update(obs).events);
+    });
+
+    const blinkEv = events.find(
+      (e): e is Extract<GestureEvent, { type: 'BLINK_MEASURED' }> => e.type === 'BLINK_MEASURED',
+    );
+    expect(blinkEv).toBeDefined();
+    expect(blinkEv?.suspectedMissedOpenValley).toBe(true);
+    expect(blinkEv?.minBlinkAvgDuringClose).toBeCloseTo(0.39, 2);
+    expect(blinkEv?.peakBlinkAvgDuringClose).toBeCloseTo(0.85, 2);
   });
 });

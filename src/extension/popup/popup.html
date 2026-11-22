@@ -48,22 +48,27 @@
         <span>최근 감지 제스처:</span>
         <strong id="lastCommand">없음</strong>
         <small id="blinkSummary">단일:0 | 긴감김:0 | 2연속:0 | 명령:0</small>
+        <small id="lastBlinkStat">최근 깜빡임: closed - | openGap -</small>
       </div>
     </section>
 
     <section class="panel">
       <div class="panel-title">
-        <span>프레임 / 백그라운드 안정성</span>
+        <span>프레임 / 병목 계측</span>
         <span id="pipelineMeta" class="mono-dim">-</span>
       </div>
       <div class="grid-4">
         <div class="metric-sm">
-          <span class="label">FPS (현재/평균)</span>
+          <span class="label">입력 / 처리 FPS (평균)</span>
           <strong id="fpsStat">-</strong>
         </div>
         <div class="metric-sm">
-          <span class="label">dt (평균/P95)</span>
+          <span class="label">카메라 / 처리 dt (P95)</span>
           <strong id="dtAvgStat">-</strong>
+        </div>
+        <div class="metric-sm">
+          <span class="label">대기 / 복사 / 추론 (ms)</span>
+          <strong id="timingStat">-</strong>
         </div>
         <div class="metric-sm">
           <span class="label">최대 dt / 갭경고</span>
@@ -74,11 +79,7 @@
           <strong id="stallStat">-</strong>
         </div>
         <div class="metric-sm">
-          <span class="label">변환 / 추론 (ms)</span>
-          <strong id="timingStat">-</strong>
-        </div>
-        <div class="metric-sm">
-          <span class="label">처리 / 드롭</span>
+          <span class="label">처리 / 드롭 (경로)</span>
           <strong id="frameCounts">-</strong>
         </div>
       </div>
@@ -152,6 +153,18 @@
           <input type="number" step="100" name="stallThresholdMs" />
         </label>
         <label>
+          입력 최대 너비 (px)
+          <select name="inputMaxWidth">
+            <option value="256">256px (고속)</option>
+            <option value="320">320px (기본)</option>
+            <option value="480">480px (고해상도)</option>
+          </select>
+        </label>
+        <label>
+          목표 FPS
+          <input type="number" min="10" max="30" step="1" name="targetFps" />
+        </label>
+        <label>
           캡처 모드 (재시작 필요)
           <select name="captureMode">
             <option value="track_processor">MediaStreamTrackProcessor</option>
@@ -164,6 +177,10 @@
             <option value="GPU">GPU (CPU 자동 폴백)</option>
             <option value="CPU">CPU (WASM)</option>
           </select>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" name="directVideoFrameGpu" />
+          GPU Zero-Copy VideoFrame 직접 입력 (directVideoFrameGpu)
         </label>
         <label class="checkbox-label">
           <input type="checkbox" name="headYawGateEnabled" />

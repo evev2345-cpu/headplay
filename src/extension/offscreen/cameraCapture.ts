@@ -1,8 +1,10 @@
 import { CaptureMode } from '../../core/config/gestureConfig';
+import { FrameInputPath } from '../../core/diagnostics/sessionMetrics';
+import { computeScaledDimensions, LatestFrameSlot } from '../../core/vision/frameScheduler';
 
 // Minimal ambient declaration for Chromium's MediaStreamTrackProcessor API (Insertable Streams).
 interface TrackProcessorCtor {
-  new (init: { track: MediaStreamTrack }): {
+  new (init: { track: MediaStreamTrack; maxBufferSize?: number }): {
     readable: ReadableStream<VideoFrame>;
   };
 }
@@ -14,12 +16,25 @@ declare global {
 }
 
 export interface CapturedFrame {
-  canvas: HTMLCanvasElement;
+  source: TexImageSource;
+  isDirectVideoFrame: boolean;
+  inputPath: FrameInputPath;
   timestampMs: number;
+  arrivalMs: number;
+  queueDelayMs: number;
   blitMs: number;
 }
 
+export interface CameraStartResult {
+  activeMode: CaptureMode;
+  resolutionLabel: string;
+  negotiatedWidth: number;
+  negotiatedHeight: number;
+  negotiatedFps: number | null;
+}
+
 export interface CameraCaptureCallbacks {
+  onCameraArrival: (arrivalMs: number) => void;
   onFrame: (frame: CapturedFrame) => void;
   onFrameDropped: () => void;
   onStreamEnded: (reason: string) => void;
@@ -29,9 +44,9 @@ export interface CameraCaptureCallbacks {
 export interface CameraCaptureOptions {
   mode: CaptureMode;
   targetFps: number;
+  inputMaxWidth: number;
   willReadFrequently?: boolean;
-  width?: number;
-  height?: number;
+  preferDirectVideoFrame?: boolean;
 }
 
 const DEFAULT_WIDTH = 320;
@@ -39,26 +54,36 @@ const DEFAULT_HEIGHT = 240;
 
 /**
  * Webcam frame capture controller for MV3 Offscreen Document.
- * Primary path uses MediaStreamTrackProcessor (event-driven, independent of requestAnimationFrame).
- * Secondary path (timer_fallback) exists explicitly for Phase 1 comparison experiments.
+ * Primary path uses MediaStreamTrackProcessor(maxBufferSize: 1) with a decoupled latest-frame-wins
+ * reader and MessageChannel scheduler so frames never queue behind inference and hidden-tab timer
+ * throttling is avoided.
+ *
+ * When GPU delegate is active and the negotiated frame width fits within inputMaxWidth, VideoFrame
+ * is handed directly to MediaPipe (zero-copy WebGL texImage2D) with immediate close() in finally.
  */
 export class CameraCapture {
   private stream: MediaStream | null = null;
   private reader: ReadableStreamDefaultReader<VideoFrame> | null = null;
   private videoEl: HTMLVideoElement | null = null;
   private fallbackTimerId: number | null = null;
+  private channel: MessageChannel | null = null;
+
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private willReadFrequently = false;
+  private preferDirectVideoFrame = true;
+  private inputMaxWidth = DEFAULT_WIDTH;
 
+  private slot = new LatestFrameSlot<VideoFrame>(30);
   private running = false;
-  private processingFrame = false;
-  private lastAcceptedMs = 0;
+  private draining = false;
+  private drainScheduled = false;
   private activeMode: CaptureMode = 'track_processor';
-  private minFrameIntervalMs = 40;
+  private targetFps = 30;
 
   constructor(width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT, willReadFrequently = false) {
     this.willReadFrequently = willReadFrequently;
+    this.inputMaxWidth = width;
     this.canvas = document.createElement('canvas');
     this.canvas.width = width;
     this.canvas.height = height;
@@ -90,6 +115,14 @@ export class CameraCapture {
     this.ctx = this.create2dContext(nextCanvas, flag);
   }
 
+  setPreferDirectVideoFrame(flag: boolean): void {
+    this.preferDirectVideoFrame = flag;
+  }
+
+  setInputMaxWidth(maxWidth: number): void {
+    this.inputMaxWidth = Math.max(160, Math.min(640, Math.round(maxWidth)));
+  }
+
   getActiveMode(): CaptureMode {
     return this.activeMode;
   }
@@ -99,29 +132,23 @@ export class CameraCapture {
   }
 
   updateTargetFps(targetFps: number): void {
-    const safeFps = Math.max(5, Math.min(30, targetFps));
-    this.minFrameIntervalMs = 1000 / safeFps;
+    this.targetFps = Math.max(5, Math.min(30, targetFps));
+    this.slot.setTargetFps(this.targetFps);
   }
 
-  async start(options: CameraCaptureOptions, callbacks: CameraCaptureCallbacks): Promise<CaptureMode> {
+  async start(options: CameraCaptureOptions, callbacks: CameraCaptureCallbacks): Promise<CameraStartResult> {
     await this.stop();
 
-    const width = options.width ?? DEFAULT_WIDTH;
-    const height = options.height ?? DEFAULT_HEIGHT;
+    this.setInputMaxWidth(options.inputMaxWidth);
     this.setWillReadFrequently(Boolean(options.willReadFrequently));
-    this.canvas.width = width;
-    this.canvas.height = height;
+    this.setPreferDirectVideoFrame(Boolean(options.preferDirectVideoFrame));
     this.updateTargetFps(options.targetFps);
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        width: { ideal: width },
-        height: { ideal: height },
-        frameRate: { ideal: options.targetFps, max: 30 },
-        facingMode: 'user',
-      },
-    });
+    const idealHeight = Math.round((this.inputMaxWidth * 3) / 4);
+    this.canvas.width = this.inputMaxWidth;
+    this.canvas.height = idealHeight;
+
+    const stream = await this.acquireCameraStream(this.inputMaxWidth, idealHeight, this.targetFps);
 
     const videoTrack = stream.getVideoTracks()[0];
     if (!videoTrack) {
@@ -129,10 +156,20 @@ export class CameraCapture {
       throw new Error('Webcam stream has no video track');
     }
 
+    const settings = videoTrack.getSettings();
+    const negotiatedWidth = settings.width ?? this.inputMaxWidth;
+    const negotiatedHeight = settings.height ?? idealHeight;
+    const negotiatedFps =
+      typeof settings.frameRate === 'number' && Number.isFinite(settings.frameRate)
+        ? Math.round(settings.frameRate * 10) / 10
+        : null;
+    const resolutionLabel = `${negotiatedWidth}x${negotiatedHeight}@${negotiatedFps ?? '?'}fps`;
+
     this.stream = stream;
     this.running = true;
-    this.processingFrame = false;
-    this.lastAcceptedMs = 0;
+    this.draining = false;
+    this.drainScheduled = false;
+    this.slot.clear();
 
     videoTrack.onended = () => {
       if (this.running) {
@@ -150,7 +187,45 @@ export class CameraCapture {
       await this.startTimerFallbackLoop(stream, callbacks);
     }
 
-    return this.activeMode;
+    return {
+      activeMode: this.activeMode,
+      resolutionLabel,
+      negotiatedWidth,
+      negotiatedHeight,
+      negotiatedFps,
+    };
+  }
+
+  private async acquireCameraStream(
+    idealWidth: number,
+    idealHeight: number,
+    targetFps: number,
+  ): Promise<MediaStream> {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          width: { ideal: idealWidth },
+          height: { ideal: idealHeight },
+          frameRate: { ideal: targetFps, min: 15, max: 30 },
+          facingMode: 'user',
+        },
+      });
+    } catch (err) {
+      // Some virtual cameras or low-light drivers reject min: 15; fall back to ideal-only.
+      if (err instanceof Error && err.name === 'OverconstrainedError') {
+        return navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            width: { ideal: idealWidth },
+            height: { ideal: idealHeight },
+            frameRate: { ideal: targetFps },
+            facingMode: 'user',
+          },
+        });
+      }
+      throw err;
+    }
   }
 
   private startTrackProcessorLoop(
@@ -158,11 +233,94 @@ export class CameraCapture {
     track: MediaStreamTrack,
     callbacks: CameraCaptureCallbacks,
   ): void {
-    const processor = new ProcessorCtor({ track });
+    const processor = new ProcessorCtor({ track, maxBufferSize: 1 });
     const reader = processor.readable.getReader();
     this.reader = reader;
 
-    const pump = async () => {
+    // MessageChannel schedules macrotasks without requestAnimationFrame pause or timer clamping.
+    const channel = new MessageChannel();
+    this.channel = channel;
+
+    const scheduleDrain = () => {
+      if (!this.running || this.drainScheduled || this.draining) return;
+      this.drainScheduled = true;
+      channel.port1.postMessage(null);
+    };
+
+    channel.port2.onmessage = () => {
+      this.drainScheduled = false;
+      if (!this.running || this.draining) return;
+
+      const startNow = performance.now();
+      const { item, droppedByRateLimit } = this.slot.takeIfReady(startNow);
+      if (droppedByRateLimit) {
+        callbacks.onFrameDropped();
+        return;
+      }
+      if (!item) return;
+
+      this.draining = true;
+      const { frame: videoFrame, arrivalMs } = item;
+      const queueDelayMs = Math.max(0, startNow - arrivalMs);
+
+      try {
+        const srcW = videoFrame.displayWidth || videoFrame.codedWidth || this.inputMaxWidth;
+        const srcH = videoFrame.displayHeight || videoFrame.codedHeight || Math.round((this.inputMaxWidth * 3) / 4);
+        const scaled = computeScaledDimensions(srcW, srcH, this.inputMaxWidth);
+
+        if (this.preferDirectVideoFrame && !scaled.needsDownscale) {
+          // Zero-copy path: pass VideoFrame directly to MediaPipe WebGL texImage2D and close immediately after.
+          try {
+            callbacks.onFrame({
+              source: videoFrame,
+              isDirectVideoFrame: true,
+              inputPath: 'video_frame_zero_copy',
+              timestampMs: arrivalMs,
+              arrivalMs,
+              queueDelayMs,
+              blitMs: 0,
+            });
+          } finally {
+            videoFrame.close();
+          }
+        } else {
+          if (this.canvas.width !== scaled.width || this.canvas.height !== scaled.height) {
+            this.canvas.width = scaled.width;
+            this.canvas.height = scaled.height;
+          }
+          const blitStart = performance.now();
+          try {
+            this.ctx.drawImage(videoFrame, 0, 0, scaled.width, scaled.height);
+          } finally {
+            videoFrame.close();
+          }
+          const blitMs = performance.now() - blitStart;
+
+          callbacks.onFrame({
+            source: this.canvas,
+            isDirectVideoFrame: false,
+            inputPath: 'canvas_downscale',
+            timestampMs: arrivalMs,
+            arrivalMs,
+            queueDelayMs,
+            blitMs,
+          });
+        }
+      } catch (err) {
+        if (this.running) {
+          callbacks.onError(err);
+        }
+      } finally {
+        this.draining = false;
+        // If a newer camera frame arrived during inference, immediately schedule next drain.
+        if (this.running && this.slot.hasPending()) {
+          scheduleDrain();
+        }
+      }
+    };
+
+    // Decoupled reader loop: continuously drains camera frames and keeps only the single freshest frame.
+    const pumpReader = async () => {
       try {
         while (this.running) {
           const { value: videoFrame, done } = await reader.read();
@@ -174,31 +332,14 @@ export class CameraCapture {
             break;
           }
 
-          const now = performance.now();
+          const arrivalMs = performance.now();
+          callbacks.onCameraArrival(arrivalMs);
 
-          // Backpressure & rate-limit drop: release hardware VideoFrame immediately.
-          if (this.processingFrame || now - this.lastAcceptedMs < this.minFrameIntervalMs * 0.85) {
-            videoFrame.close();
+          const droppedOlder = this.slot.push(videoFrame, arrivalMs);
+          if (droppedOlder) {
             callbacks.onFrameDropped();
-            continue;
           }
-
-          this.processingFrame = true;
-          const blitStart = performance.now();
-          try {
-            this.ctx.drawImage(videoFrame, 0, 0, this.canvas.width, this.canvas.height);
-          } finally {
-            // Always close VideoFrame immediately after blitting to canvas to avoid buffer leaks.
-            videoFrame.close();
-          }
-          const blitMs = performance.now() - blitStart;
-
-          this.lastAcceptedMs = now;
-          try {
-            callbacks.onFrame({ canvas: this.canvas, timestampMs: now, blitMs });
-          } finally {
-            this.processingFrame = false;
-          }
+          scheduleDrain();
         }
       } catch (err) {
         if (this.running) {
@@ -207,7 +348,7 @@ export class CameraCapture {
       }
     };
 
-    void pump();
+    void pumpReader();
   }
 
   private async startTimerFallbackLoop(
@@ -223,33 +364,60 @@ export class CameraCapture {
 
     await video.play();
 
-    const intervalMs = Math.max(33, Math.round(this.minFrameIntervalMs));
+    const intervalMs = Math.max(33, Math.round(1000 / this.targetFps));
     this.fallbackTimerId = window.setInterval(() => {
       if (!this.running || !this.videoEl) return;
       if (this.videoEl.readyState < 2) return;
-      if (this.processingFrame) {
+
+      const arrivalMs = performance.now();
+      callbacks.onCameraArrival(arrivalMs);
+
+      if (this.draining) {
         callbacks.onFrameDropped();
         return;
       }
 
-      const now = performance.now();
-      this.processingFrame = true;
+      this.draining = true;
       try {
+        const scaled = computeScaledDimensions(
+          this.videoEl.videoWidth || this.inputMaxWidth,
+          this.videoEl.videoHeight || Math.round((this.inputMaxWidth * 3) / 4),
+          this.inputMaxWidth,
+        );
+        if (this.canvas.width !== scaled.width || this.canvas.height !== scaled.height) {
+          this.canvas.width = scaled.width;
+          this.canvas.height = scaled.height;
+        }
         const blitStart = performance.now();
-        this.ctx.drawImage(this.videoEl, 0, 0, this.canvas.width, this.canvas.height);
+        this.ctx.drawImage(this.videoEl, 0, 0, scaled.width, scaled.height);
         const blitMs = performance.now() - blitStart;
-        this.lastAcceptedMs = now;
-        callbacks.onFrame({ canvas: this.canvas, timestampMs: now, blitMs });
+        callbacks.onFrame({
+          source: this.canvas,
+          isDirectVideoFrame: false,
+          inputPath: 'timer_video_canvas',
+          timestampMs: arrivalMs,
+          arrivalMs,
+          queueDelayMs: 0,
+          blitMs,
+        });
       } catch (err) {
         callbacks.onError(err);
       } finally {
-        this.processingFrame = false;
+        this.draining = false;
       }
     }, intervalMs);
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    this.drainScheduled = false;
+    this.slot.clear();
+
+    if (this.channel) {
+      this.channel.port1.close();
+      this.channel.port2.close();
+      this.channel = null;
+    }
 
     if (this.fallbackTimerId !== null) {
       window.clearInterval(this.fallbackTimerId);
@@ -280,6 +448,6 @@ export class CameraCapture {
       this.stream = null;
     }
 
-    this.processingFrame = false;
+    this.draining = false;
   }
 }
