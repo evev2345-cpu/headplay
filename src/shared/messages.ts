@@ -53,7 +53,7 @@ export type BackgroundMessage =
       target: 'background';
       type: 'OFFSCREEN_TRACKING_STARTED';
       captureMode: CaptureMode;
-      activeDelegate: DelegatePreference;
+      activeDelegate: DelegatePreference | 'BYPASS';
     }
   | {
       target: 'background';

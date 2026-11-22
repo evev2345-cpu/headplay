@@ -28,12 +28,27 @@ export type FrameInputPath =
   | 'video_frame_zero_copy'
   | 'canvas_downscale'
   | 'timer_video_canvas'
+  | 'bypass_inference'
   | 'unknown';
 
+export interface ReadArrivalTelemetry {
+  readCallStartMs: number;
+  readResolveMs: number;
+  readWaitMs: number;
+  readCallIntervalMs: number | null;
+  readToNextReadCallMs: number | null;
+  videoFrameTimestampUs: number | null;
+  processorTotalFrames: number | null;
+  processorDiscardedFrames: number | null;
+}
+
 export interface FrameProcessingTiming {
+  scheduleDelayMs?: number;
   queueDelayMs?: number;
   blitMs?: number;
+  receiveToInferStartMs?: number;
   inferMs?: number;
+  inferEndMs?: number;
   totalProcessMs?: number;
   inputPath?: FrameInputPath;
 }
@@ -54,12 +69,26 @@ export interface SessionMetricsSnapshot {
   startedAtIso: string | null;
   uptimeMs: number;
   captureMode: CaptureMode;
-  activeDelegate: DelegatePreference | 'UNINITIALIZED';
+  activeDelegate: DelegatePreference | 'BYPASS' | 'UNINITIALIZED';
+  diagnosticBypassInference: boolean;
   cameraResolution: string;
+  trackReportedFps: number | null;
+  trackCapabilitiesSummary: string;
   inputPath: FrameInputPath;
   cameraInputFrames: number;
+  /** Rolling 1s FPS of reader.read() resolutions (application read FPS, NOT nominal track frameRate). */
   cameraInputFps: number;
+  avgAppReadFps: number;
+  /** Estimated source capture FPS derived from hardware VideoFrame.timestamp (microseconds) deltas. */
+  sourceFrameFps: number;
+  avgSourceFrameDeltaMs: number;
   avgCameraIntervalMs: number;
+  avgReadCallIntervalMs: number;
+  avgReadWaitMs: number;
+  maxReadWaitMs: number;
+  avgReadToNextReadCallMs: number;
+  processorTotalFrames: number | null;
+  processorDiscardedFrames: number | null;
   totalFrames: number;
   droppedFrames: number;
   faceDetectedFrames: number;
@@ -69,9 +98,13 @@ export interface SessionMetricsSnapshot {
   avgDtMs: number;
   maxDtMs: number;
   p95DtMs: number;
+  avgScheduleDelayMs: number;
   avgQueueDelayMs: number;
   avgBlitMs: number;
+  avgReceiveToInferStartMs: number;
   avgInferMs: number;
+  avgInferEndToNextReadCallMs: number;
+  avgInferEndToNextReadResolveMs: number;
   avgProcessMs: number;
   frameGapWarnings: number;
   stallThresholdMs: number;
@@ -148,8 +181,11 @@ export class SessionMetrics {
   private lastWallMs: number | null = null;
 
   private captureMode: CaptureMode = 'track_processor';
-  private activeDelegate: DelegatePreference | 'UNINITIALIZED' = 'UNINITIALIZED';
+  private activeDelegate: DelegatePreference | 'BYPASS' | 'UNINITIALIZED' = 'UNINITIALIZED';
+  private diagnosticBypassInference = false;
   private cameraResolution = '-';
+  private trackReportedFps: number | null = null;
+  private trackCapabilitiesSummary = '-';
   private inputPath: FrameInputPath = 'unknown';
   private stallThresholdMs = 1000;
 
@@ -158,6 +194,26 @@ export class SessionMetrics {
   private cameraIntervalSum = 0;
   private cameraIntervalCount = 0;
   private recentCameraTimestamps: number[] = [];
+
+  private lastVideoFrameTsUs: number | null = null;
+  private sourceDeltaSumMs = 0;
+  private sourceDeltaCount = 0;
+
+  private readCallIntervalSum = 0;
+  private readCallIntervalCount = 0;
+  private readWaitSum = 0;
+  private readWaitCount = 0;
+  private maxReadWaitMs = 0;
+  private readToNextCallSum = 0;
+  private readToNextCallCount = 0;
+  private processorTotalFrames: number | null = null;
+  private processorDiscardedFrames: number | null = null;
+
+  private lastInferEndMs: number | null = null;
+  private inferEndToNextReadCallSum = 0;
+  private inferEndToNextReadCallCount = 0;
+  private inferEndToNextReadResolveSum = 0;
+  private inferEndToNextReadResolveCount = 0;
 
   private totalFrames = 0;
   private droppedFrames = 0;
@@ -176,10 +232,14 @@ export class SessionMetrics {
   private recentDts: number[] = [];
   private recentFrameTimestamps: number[] = [];
 
+  private scheduleDelaySum = 0;
+  private scheduleDelayCount = 0;
   private queueDelaySum = 0;
   private queueDelayCount = 0;
   private blitSum = 0;
   private blitCount = 0;
+  private receiveToInferSum = 0;
+  private receiveToInferCount = 0;
   private inferSum = 0;
   private inferCount = 0;
   private processSum = 0;
@@ -220,27 +280,42 @@ export class SessionMetrics {
     inputPath: FrameInputPath,
     timestampMs?: number,
     wallTimeMs = Date.now(),
+    extra?: { trackReportedFps?: number | null; capabilitiesSummary?: string },
   ): void {
     this.cameraResolution = resolution;
     this.inputPath = inputPath;
+    if (extra?.trackReportedFps !== undefined) {
+      this.trackReportedFps = extra.trackReportedFps;
+    }
+    if (extra?.capabilitiesSummary !== undefined) {
+      this.trackCapabilitiesSummary = extra.capabilitiesSummary;
+    }
     if (timestampMs !== undefined) {
       this.pushLog(
         timestampMs,
         'SESSION',
-        `Camera negotiated: ${resolution}, inputPath=${inputPath}`,
-        { resolution, inputPath },
+        `Camera negotiated: ${resolution} (trackFps=${this.trackReportedFps ?? '?'}, caps=${this.trackCapabilitiesSummary}), inputPath=${inputPath}`,
+        {
+          resolution,
+          trackReportedFps: this.trackReportedFps,
+          capabilitiesSummary: this.trackCapabilitiesSummary,
+          inputPath,
+        },
         wallTimeMs,
       );
     }
   }
 
-  recordCameraArrival(arrivalPerfMs: number): void {
+  recordCameraArrival(arrival: number | ReadArrivalTelemetry): void {
+    const arrivalPerfMs = typeof arrival === 'number' ? arrival : arrival.readResolveMs;
     this.cameraInputFrames += 1;
+
     if (this.lastCameraArrivalMs !== null && arrivalPerfMs >= this.lastCameraArrivalMs) {
       this.cameraIntervalSum += arrivalPerfMs - this.lastCameraArrivalMs;
       this.cameraIntervalCount += 1;
     }
     this.lastCameraArrivalMs = arrivalPerfMs;
+
     this.recentCameraTimestamps.push(arrivalPerfMs);
     while (
       this.recentCameraTimestamps.length > 0 &&
@@ -248,14 +323,78 @@ export class SessionMetrics {
     ) {
       this.recentCameraTimestamps.shift();
     }
+
+    if (typeof arrival !== 'number') {
+      if (Number.isFinite(arrival.readWaitMs) && arrival.readWaitMs >= 0) {
+        this.readWaitSum += arrival.readWaitMs;
+        this.readWaitCount += 1;
+        if (arrival.readWaitMs > this.maxReadWaitMs) {
+          this.maxReadWaitMs = arrival.readWaitMs;
+        }
+      }
+      if (
+        arrival.readCallIntervalMs !== null &&
+        Number.isFinite(arrival.readCallIntervalMs) &&
+        arrival.readCallIntervalMs >= 0
+      ) {
+        this.readCallIntervalSum += arrival.readCallIntervalMs;
+        this.readCallIntervalCount += 1;
+      }
+      if (
+        arrival.readToNextReadCallMs !== null &&
+        Number.isFinite(arrival.readToNextReadCallMs) &&
+        arrival.readToNextReadCallMs >= 0
+      ) {
+        this.readToNextCallSum += arrival.readToNextReadCallMs;
+        this.readToNextCallCount += 1;
+      }
+      if (
+        arrival.videoFrameTimestampUs !== null &&
+        Number.isFinite(arrival.videoFrameTimestampUs)
+      ) {
+        if (
+          this.lastVideoFrameTsUs !== null &&
+          arrival.videoFrameTimestampUs > this.lastVideoFrameTsUs
+        ) {
+          const deltaMs = (arrival.videoFrameTimestampUs - this.lastVideoFrameTsUs) / 1000;
+          if (deltaMs > 0 && deltaMs < 5000) {
+            this.sourceDeltaSumMs += deltaMs;
+            this.sourceDeltaCount += 1;
+          }
+        }
+        this.lastVideoFrameTsUs = arrival.videoFrameTimestampUs;
+      }
+      if (arrival.processorTotalFrames !== null) {
+        this.processorTotalFrames = arrival.processorTotalFrames;
+      }
+      if (arrival.processorDiscardedFrames !== null) {
+        this.processorDiscardedFrames = arrival.processorDiscardedFrames;
+      }
+
+      // Measure gap from previous inference completion to the next read call / frame arrival.
+      if (this.lastInferEndMs !== null) {
+        const toResolve = Math.max(0, arrival.readResolveMs - this.lastInferEndMs);
+        this.inferEndToNextReadResolveSum += toResolve;
+        this.inferEndToNextReadResolveCount += 1;
+        if (arrival.readCallStartMs >= this.lastInferEndMs) {
+          this.inferEndToNextReadCallSum += arrival.readCallStartMs - this.lastInferEndMs;
+          this.inferEndToNextReadCallCount += 1;
+        } else {
+          // Decoupled reader already re-entered reader.read() before inference ended (0ms post-infer call delay).
+          this.inferEndToNextReadCallCount += 1;
+        }
+        this.lastInferEndMs = null;
+      }
+    }
   }
 
   startSession(
     timestampMs: number,
     captureMode: CaptureMode,
-    activeDelegate: DelegatePreference,
+    activeDelegate: DelegatePreference | 'BYPASS',
     wallTimeMs = Date.now(),
     stallThresholdMs?: number,
+    diagnosticBypassInference = false,
   ): void {
     const keepThreshold = stallThresholdMs ?? this.stallThresholdMs;
     this.reset();
@@ -266,14 +405,16 @@ export class SessionMetrics {
     this.lastWallMs = wallTimeMs;
     this.captureMode = captureMode;
     this.activeDelegate = activeDelegate;
+    this.diagnosticBypassInference = diagnosticBypassInference;
     this.getOrCreateSegment(this.currentMarker);
     this.pushLog(
       timestampMs,
       'SESSION',
-      `Tracking started (${captureMode}, delegate=${activeDelegate}, stallThreshold=${this.stallThresholdMs}ms)`,
+      `Tracking started (${captureMode}, delegate=${activeDelegate}, bypassInference=${diagnosticBypassInference}, stallThreshold=${this.stallThresholdMs}ms)`,
       {
         captureMode,
         activeDelegate,
+        diagnosticBypassInference,
         stallThresholdMs: this.stallThresholdMs,
       },
       wallTimeMs,
@@ -285,13 +426,33 @@ export class SessionMetrics {
     this.startedAtPerfMs = null;
     this.lastPerfMs = null;
     this.lastWallMs = null;
+    this.diagnosticBypassInference = false;
     this.cameraResolution = '-';
+    this.trackReportedFps = null;
+    this.trackCapabilitiesSummary = '-';
     this.inputPath = 'unknown';
     this.cameraInputFrames = 0;
     this.lastCameraArrivalMs = null;
     this.cameraIntervalSum = 0;
     this.cameraIntervalCount = 0;
     this.recentCameraTimestamps = [];
+    this.lastVideoFrameTsUs = null;
+    this.sourceDeltaSumMs = 0;
+    this.sourceDeltaCount = 0;
+    this.readCallIntervalSum = 0;
+    this.readCallIntervalCount = 0;
+    this.readWaitSum = 0;
+    this.readWaitCount = 0;
+    this.maxReadWaitMs = 0;
+    this.readToNextCallSum = 0;
+    this.readToNextCallCount = 0;
+    this.processorTotalFrames = null;
+    this.processorDiscardedFrames = null;
+    this.lastInferEndMs = null;
+    this.inferEndToNextReadCallSum = 0;
+    this.inferEndToNextReadCallCount = 0;
+    this.inferEndToNextReadResolveSum = 0;
+    this.inferEndToNextReadResolveCount = 0;
     this.totalFrames = 0;
     this.droppedFrames = 0;
     this.faceDetectedFrames = 0;
@@ -306,10 +467,14 @@ export class SessionMetrics {
     this.maxDtMs = 0;
     this.recentDts = [];
     this.recentFrameTimestamps = [];
+    this.scheduleDelaySum = 0;
+    this.scheduleDelayCount = 0;
     this.queueDelaySum = 0;
     this.queueDelayCount = 0;
     this.blitSum = 0;
     this.blitCount = 0;
+    this.receiveToInferSum = 0;
+    this.receiveToInferCount = 0;
     this.inferSum = 0;
     this.inferCount = 0;
     this.processSum = 0;
@@ -433,21 +598,37 @@ export class SessionMetrics {
     this.pushLog(
       timestampMs,
       'SESSION',
-      `HEARTBEAT [${snap.currentMarker}]: inFps=${snap.cameraInputFps}, fps=${snap.rollingFps}(avg=${snap.avgFps}), avgDt=${snap.avgDtMs}ms, q=${snap.avgQueueDelayMs}ms, blit=${snap.avgBlitMs}ms, infer=${snap.avgInferMs}ms, stalls=${snap.stallCount}(${snap.totalStallMs}ms)`,
+      `HEARTBEAT [${snap.currentMarker}]: trackFps=${snap.trackReportedFps ?? '?'}, srcFps=${snap.sourceFrameFps}, readFps=${snap.cameraInputFps}(avg=${snap.avgAppReadFps}), procFps=${snap.rollingFps}(avg=${snap.avgFps}), readWait=${snap.avgReadWaitMs}ms, mc=${snap.avgScheduleDelayMs}ms, r2i=${snap.avgReceiveToInferStartMs}ms, infer=${snap.avgInferMs}ms, i2r=${snap.avgInferEndToNextReadResolveMs}ms`,
       {
         marker: snap.currentMarker,
         cameraResolution: snap.cameraResolution,
+        trackReportedFps: snap.trackReportedFps,
+        trackCapabilitiesSummary: snap.trackCapabilitiesSummary,
+        diagnosticBypassInference: snap.diagnosticBypassInference,
         inputPath: snap.inputPath,
+        sourceFrameFps: snap.sourceFrameFps,
+        avgSourceFrameDeltaMs: snap.avgSourceFrameDeltaMs,
         cameraInputFps: snap.cameraInputFps,
+        avgAppReadFps: snap.avgAppReadFps,
         avgCameraIntervalMs: snap.avgCameraIntervalMs,
+        avgReadCallIntervalMs: snap.avgReadCallIntervalMs,
+        avgReadWaitMs: snap.avgReadWaitMs,
+        maxReadWaitMs: snap.maxReadWaitMs,
+        avgReadToNextReadCallMs: snap.avgReadToNextReadCallMs,
+        processorTotalFrames: snap.processorTotalFrames,
+        processorDiscardedFrames: snap.processorDiscardedFrames,
         rollingFps: snap.rollingFps,
         avgFps: snap.avgFps,
         avgDtMs: snap.avgDtMs,
         maxDtMs: snap.maxDtMs,
         p95DtMs: snap.p95DtMs,
+        avgScheduleDelayMs: snap.avgScheduleDelayMs,
         avgQueueDelayMs: snap.avgQueueDelayMs,
         avgBlitMs: snap.avgBlitMs,
+        avgReceiveToInferStartMs: snap.avgReceiveToInferStartMs,
         avgInferMs: snap.avgInferMs,
+        avgInferEndToNextReadCallMs: snap.avgInferEndToNextReadCallMs,
+        avgInferEndToNextReadResolveMs: snap.avgInferEndToNextReadResolveMs,
         avgProcessMs: snap.avgProcessMs,
         droppedFrames: snap.droppedFrames,
         frameGapWarnings: snap.frameGapWarnings,
@@ -525,6 +706,10 @@ export class SessionMetrics {
       this.faceDetectedFrames += 1;
     }
 
+    if (timing?.scheduleDelayMs !== undefined && Number.isFinite(timing.scheduleDelayMs)) {
+      this.scheduleDelaySum += timing.scheduleDelayMs;
+      this.scheduleDelayCount += 1;
+    }
     if (timing?.queueDelayMs !== undefined && Number.isFinite(timing.queueDelayMs)) {
       this.queueDelaySum += timing.queueDelayMs;
       this.queueDelayCount += 1;
@@ -533,9 +718,16 @@ export class SessionMetrics {
       this.blitSum += timing.blitMs;
       this.blitCount += 1;
     }
+    if (timing?.receiveToInferStartMs !== undefined && Number.isFinite(timing.receiveToInferStartMs)) {
+      this.receiveToInferSum += timing.receiveToInferStartMs;
+      this.receiveToInferCount += 1;
+    }
     if (timing?.inferMs !== undefined && Number.isFinite(timing.inferMs)) {
       this.inferSum += timing.inferMs;
       this.inferCount += 1;
+    }
+    if (timing?.inferEndMs !== undefined && Number.isFinite(timing.inferEndMs)) {
+      this.lastInferEndMs = timing.inferEndMs;
     }
     if (timing?.totalProcessMs !== undefined && Number.isFinite(timing.totalProcessMs)) {
       this.processSum += timing.totalProcessMs;
@@ -690,13 +882,34 @@ export class SessionMetrics {
     const refNow = nowPerfMs ?? this.lastPerfMs ?? this.startedAtPerfMs ?? 0;
     const uptimeMs = this.startedAtPerfMs !== null ? Math.max(0, refNow - this.startedAtPerfMs) : 0;
     const avgFps = uptimeMs > 0 ? (this.totalFrames * 1000) / uptimeMs : 0;
+    const avgAppReadFps = uptimeMs > 0 ? (this.cameraInputFrames * 1000) / uptimeMs : 0;
+    const avgSourceFrameDeltaMs =
+      this.sourceDeltaCount > 0 ? this.sourceDeltaSumMs / this.sourceDeltaCount : 0;
+    const sourceFrameFps = avgSourceFrameDeltaMs > 0 ? 1000 / avgSourceFrameDeltaMs : 0;
     const avgDtMs = this.dtCount > 0 ? this.dtSum / this.dtCount : 0;
     const avgCameraIntervalMs =
       this.cameraIntervalCount > 0 ? this.cameraIntervalSum / this.cameraIntervalCount : 0;
+    const avgReadCallIntervalMs =
+      this.readCallIntervalCount > 0 ? this.readCallIntervalSum / this.readCallIntervalCount : 0;
+    const avgReadWaitMs = this.readWaitCount > 0 ? this.readWaitSum / this.readWaitCount : 0;
+    const avgReadToNextReadCallMs =
+      this.readToNextCallCount > 0 ? this.readToNextCallSum / this.readToNextCallCount : 0;
     const p95DtMs = computePercentile(this.recentDts, 0.95);
+    const avgScheduleDelayMs =
+      this.scheduleDelayCount > 0 ? this.scheduleDelaySum / this.scheduleDelayCount : 0;
     const avgQueueDelayMs = this.queueDelayCount > 0 ? this.queueDelaySum / this.queueDelayCount : 0;
     const avgBlitMs = this.blitCount > 0 ? this.blitSum / this.blitCount : 0;
+    const avgReceiveToInferStartMs =
+      this.receiveToInferCount > 0 ? this.receiveToInferSum / this.receiveToInferCount : 0;
     const avgInferMs = this.inferCount > 0 ? this.inferSum / this.inferCount : 0;
+    const avgInferEndToNextReadCallMs =
+      this.inferEndToNextReadCallCount > 0
+        ? this.inferEndToNextReadCallSum / this.inferEndToNextReadCallCount
+        : 0;
+    const avgInferEndToNextReadResolveMs =
+      this.inferEndToNextReadResolveCount > 0
+        ? this.inferEndToNextReadResolveSum / this.inferEndToNextReadResolveCount
+        : 0;
     const avgProcessMs = this.processCount > 0 ? this.processSum / this.processCount : 0;
 
     let activeStallDurationMs = 0;
@@ -726,11 +939,23 @@ export class SessionMetrics {
       uptimeMs: Math.round(uptimeMs),
       captureMode: this.captureMode,
       activeDelegate: this.activeDelegate,
+      diagnosticBypassInference: this.diagnosticBypassInference,
       cameraResolution: this.cameraResolution,
+      trackReportedFps: this.trackReportedFps,
+      trackCapabilitiesSummary: this.trackCapabilitiesSummary,
       inputPath: this.inputPath,
       cameraInputFrames: this.cameraInputFrames,
       cameraInputFps: this.recentCameraTimestamps.length,
+      avgAppReadFps: round2(avgAppReadFps),
+      sourceFrameFps: round2(sourceFrameFps),
+      avgSourceFrameDeltaMs: round2(avgSourceFrameDeltaMs),
       avgCameraIntervalMs: round2(avgCameraIntervalMs),
+      avgReadCallIntervalMs: round2(avgReadCallIntervalMs),
+      avgReadWaitMs: round2(avgReadWaitMs),
+      maxReadWaitMs: round2(this.maxReadWaitMs),
+      avgReadToNextReadCallMs: round2(avgReadToNextReadCallMs),
+      processorTotalFrames: this.processorTotalFrames,
+      processorDiscardedFrames: this.processorDiscardedFrames,
       totalFrames: this.totalFrames,
       droppedFrames: this.droppedFrames,
       faceDetectedFrames: this.faceDetectedFrames,
@@ -740,9 +965,13 @@ export class SessionMetrics {
       avgDtMs: round2(avgDtMs),
       maxDtMs: round2(this.maxDtMs),
       p95DtMs: round2(p95DtMs),
+      avgScheduleDelayMs: round2(avgScheduleDelayMs),
       avgQueueDelayMs: round2(avgQueueDelayMs),
       avgBlitMs: round2(avgBlitMs),
+      avgReceiveToInferStartMs: round2(avgReceiveToInferStartMs),
       avgInferMs: round2(avgInferMs),
+      avgInferEndToNextReadCallMs: round2(avgInferEndToNextReadCallMs),
+      avgInferEndToNextReadResolveMs: round2(avgInferEndToNextReadResolveMs),
       avgProcessMs: round2(avgProcessMs),
       frameGapWarnings: this.frameGapWarnings,
       stallThresholdMs: this.stallThresholdMs,

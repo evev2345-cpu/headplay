@@ -6,7 +6,10 @@
    - **결정**: `MediaStreamTrackProcessor({ track, maxBufferSize: 1 })`의 리더 루프(`pumpReader`)와 추론 스케줄러(`MessageChannel` 기반 `LatestFrameSlot`)를 분리해 추론 중 프레임이 쌓이지 않고 항상 최신 프레임만 처리한다(이전 미처리 `VideoFrame`은 즉시 `close()`).
    - **Zero-Copy GPU 경로 & Canvas 분기**: `delegate: 'GPU'`이고 카메라 프레임 너비가 `inputMaxWidth`(기본 320px) 이하이면 `VideoFrame`을 `FaceLandmarker.detectForVideo()`에 직접 전달(복사 0ms, `finally`에서 즉시 `close()`)하며, 드라이버 비호환·고해상도·`CPU` delegate에서는 비율 유지 리사이즈 캔버스(`CPU`일 때만 `willReadFrequently: true`)로 자동 폴백한다.
    - **카메라 30fps 협상 & 클리핑 제거**: 기본 `targetFps`를 `30`으로 상향하고 `frameRate: { ideal: 30, min: 15, max: 30 }`으로 요청하며, `targetFps === 30`일 때 인위적 소프트웨어 프레임 드롭을 제거해 30fps(33.3ms) 웹캠이 15fps로 반감되는 문제를 해소했다.
-   - **단계별 병목 분리 계측**: 카메라 입력 FPS(`cameraInputFps`·`avgCameraIntervalMs`), 최신 프레임 대기(`avgQueueDelayMs`), 이미지 복사(`avgBlitMs`), MediaPipe 추론(`avgInferMs`), 전체 처리(`avgProcessMs`), 처리 간격(`avgDtMs`/`p95DtMs`/`maxDtMs`)을 분리 기록한다.
+   - **단계별 병목 분리 계측 (Phase 1.1 진단 확장)**:
+     - 4종 FPS 분리: `trackReportedFps`(`MediaStreamTrack.getSettings().frameRate`), `sourceFrameFps`/`avgSourceFrameDeltaMs`(`VideoFrame.timestamp` μs 기준 하드웨어 출력 추정), `cameraInputFps`/`avgAppReadFps`(애플리케이션 `reader.read()` 수신 속도), `rollingFps`/`avgFps`(실제 추론·처리 FPS).
+     - `reader.read()` 및 스케줄링 구간 계측: `avgReadWaitMs`/`maxReadWaitMs`, `avgReadCallIntervalMs`, `avgReadToNextReadCallMs`, `avgScheduleDelayMs`(`MessageChannel` post→onmessage 지연), `avgReceiveToInferStartMs`(프레임 수신→추론 시작), `avgInferEndToNextReadCallMs`/`avgInferEndToNextReadResolveMs`(추론 종료→다음 `read()` 호출/도착), `avgBlitMs`, `avgInferMs`, `avgProcessMs`, `avgDtMs`/`p95DtMs`/`maxDtMs`.
+     - **추론 비활성화 진단 모드(`diagnosticBypassInference`) & 캡처 해상도 프리셋(`cameraCaptureResolution`: `320x240` / `640x480` / `default`)**: MediaPipe 추론·WebGL 호출을 완전히 끄고 순수 `reader.read()` 입력 FPS를 실측해 카메라 드라이버/노출 병목 vs GPU/WebGL 경합 vs Offscreen 스로틀링을 분리 검증한다.
 
 2. **MediaPipe WASM 및 모델 100% 로컬 번들링**
    - **결정**: `@mediapipe/tasks-vision`의 `wasm/*` 및 `face_landmarker.task` 모델을 `dist/vendor/mediapipe/`에 로컬 번들링하고 `chrome.runtime.getURL()`로만 로드한다. `manifest.json`에는 `'wasm-unsafe-eval'`만 허용한다.
@@ -40,12 +43,12 @@
 
 ### ① 자동화 단위 테스트 및 정적·빌드 검증 (개발 VM 완료 — 통과)
 - `npm run typecheck` (`tsc --noEmit`): 통과
-- `npm run test` (`vitest run`): **6개 테스트 파일, 38개 단위 테스트 통과**
+- `npm run test` (`vitest run`): **6개 테스트 파일, 40개 단위 테스트 통과**
   - `gestureConfig.test.ts` (3): 임계값 범위·히스테리시스·가드밴드 불변조건 검증
   - `eyeFeatureExtractor.test.ts` (6): 양안 동시 감김/윙크 배제, EAR, Blendshape/Iris 시선, 고개 회전(4×4 행렬·랜드마크 폴백) 시선 차단 검증
   - `frameScheduler.test.ts` (4): `LatestFrameSlot` 최신 프레임 우선·이전 프레임 즉시 `close()`, 30fps 비클리핑, 비율 유지 리사이즈 검증
   - `gestureStateMachine.test.ts` (15): 기존 12개 + **20fps 4연속 짧은 깜빡임 비오탐**, **8.3fps(120ms) 중간 OPEN 누락 에일리어싱 재현**, **부분 재개방 W자형 밸리(`suspectedMissedOpenValley`) 감지** 검증
-  - `sessionMetrics.test.ts` (6): 기존 5개 + **카메라 입력 FPS·단계별 지연(`queue`/`blit`/`infer`/`process`)·`BLINK` `closed`/`openGap` 로그** 검증
+  - `sessionMetrics.test.ts` (8): 기존 6개 + **4종 FPS(`trackReportedFps`/`sourceFrameFps`/`cameraInputFps`/`rollingFps`)·`read()` 대기/간격·`MessageChannel`·`receiveToInferStart`/`inferEndToNextRead` 계측** 및 **추론 비활성화(`diagnosticBypassInference`) 진단 모드** 검증
   - `windowVisibility.test.ts` (4): `CHROME_ALL_MINIMIZED` vs `CHROME_UNFOCUSED_VISIBLE` vs `CHROME_FOCUSED` vs `NO_CHROME_WINDOWS` 분류 검증
 - `npm run build`: `dist/` MV3 번들 생성 및 `dist/*.js` 내 `eval(`, `new Function`, 외부 `http(s)://` URL **0건** 확인
 
@@ -64,7 +67,8 @@
 
 | ID | 항목 | 수행 절차 | 합격 기준 (Go/No-Go) | 상태 |
 | :--- | :--- | :--- | :--- | :---: |
-| **TC-05-W0** | **Phase 1.1: FPS 병목 실측 (`320px` vs `256px`, `ZC` vs `CV`)** | 트래킹 시작 후 팝업의 `입력/처리 FPS`, `대기/복사/추론(ms)`, `경로(ZC/CV)` 1분 이상 관찰 및 JSON 내보내기 | 실제 처리 FPS ≥15(목표 ≥20), `avgDtMs` ≤66ms, `cameraInputFps`·`avgBlitMs`·`avgInferMs` 수치 확보 | **미검증** |
+| **TC-05-W0A** | **Phase 1.1: 8~9 FPS 병목 원인 분리 진단** | 설정에서 **기본값 복원**(또는 `targetFps=30`) 후 4개 조건을 각 30초 측정:<br>A. `320×240`, 추론 OFF(`diagnosticBypassInference=ON`)<br>B. `640×480` 또는 `default`, 추론 OFF<br>C. 최고 입력 FPS 해상도 + 추론 ON (`ZC/GPU`)<br>D. 동일 조건 + `directVideoFrameGpu=OFF` (또는 `CPU`) | A vs B로 드라이버/해상도/조명 병목 분리, A vs C로 WebGL/MediaPipe 경합 분리. `trackReportedFps`/`sourceFrameFps`/`cameraInputFps`/`avgReadWaitMs`/`avgScheduleDelayMs` JSON 확보 | **미검증** |
+| **TC-05-W0** | **Phase 1.1: FPS 병목 실측 (`320px` vs `256px`, `ZC` vs `CV`)** | 트래킹 시작 후 팝업의 `트랙/소스/수신/처리 FPS`, `read() 대기`, `MC/수신→추론/추론→수신`, `복사/추론(ms)` 1분 이상 관찰 및 JSON 내보내기 | 실제 처리 FPS ≥15(목표 ≥20), `avgDtMs` ≤66ms, 병목 수치 확보 | **미검증** |
 | **TC-05-W1** | 포커스 상실 vs 완전 최소화 구분 | 1. Chrome 창을 열어둔 채 `Alt+Tab`으로 메모장 활성화<br>2. 모든 Chrome 창 최소화 | 로그 마커가 `CHROME_UNFOCUSED_VISIBLE`과 `CHROME_ALL_MINIMIZED`로 정확히 분리 기록 | **미검증** |
 | **TC-05-W2** | Windows 11 완전 최소화 3분 지속성 (`GPU` vs `CPU`) | 모든 Chrome 창 최소화 상태에서 타 Windows 앱 사용하며 3분간 제스처 각 10회 수행 → 복원 → **카메라 중지 → JSON 내보내기** | `segmentStats.CHROME_ALL_MINIMIZED` 기준 평균 ≥12~15 FPS, `totalStallMs === 0`, 제스처 정상 인식 | **미검증** |
 | **TC-05-W3** | Windows 카메라 점유 충돌 및 절전/잠금(`Win+L`) 복구 | Zoom/Windows 카메라 앱 동시 실행 시 오류 표시 확인, `Win+L` 잠금 후 복귀 시 상태 확인 | 오류/스트림 종료(`STREAM_ENDED`) 명확 표시, 침묵 정지 없음 | **미검증** |

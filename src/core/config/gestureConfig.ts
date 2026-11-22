@@ -1,6 +1,7 @@
 export type GazeMethod = 'blendshape' | 'iris' | 'hybrid';
 export type CaptureMode = 'track_processor' | 'timer_fallback';
 export type DelegatePreference = 'GPU' | 'CPU';
+export type CameraCaptureResolution = '320x240' | '640x480' | 'default';
 
 export interface GestureConfig {
   // Blink detection thresholds (0..1 MediaPipe eyeBlink score)
@@ -42,8 +43,10 @@ export interface GestureConfig {
   captureMode: CaptureMode;
   delegatePreference: DelegatePreference;
   targetFps: number;
+  cameraCaptureResolution: CameraCaptureResolution;
   inputMaxWidth: number;
   directVideoFrameGpu: boolean;
+  diagnosticBypassInference: boolean;
 }
 
 export const DEFAULT_GESTURE_CONFIG: Readonly<GestureConfig> = Object.freeze({
@@ -79,8 +82,10 @@ export const DEFAULT_GESTURE_CONFIG: Readonly<GestureConfig> = Object.freeze({
   captureMode: 'track_processor',
   delegatePreference: 'GPU',
   targetFps: 30,
+  cameraCaptureResolution: '320x240',
   inputMaxWidth: 320,
   directVideoFrameGpu: true,
+  diagnosticBypassInference: false,
 });
 
 function clamp(value: number, min: number, max: number): number {
@@ -167,6 +172,13 @@ export function sanitizeGestureConfig(partial?: Partial<GestureConfig>): Gesture
       ? input.delegatePreference
       : d.delegatePreference;
 
+  const cameraCaptureResolution: CameraCaptureResolution =
+    input.cameraCaptureResolution === '320x240' ||
+    input.cameraCaptureResolution === '640x480' ||
+    input.cameraCaptureResolution === 'default'
+      ? input.cameraCaptureResolution
+      : d.cameraCaptureResolution;
+
   const targetFps = clamp(finiteOr(input.targetFps, d.targetFps), 10, 30);
   const inputMaxWidth = Math.round(clamp(finiteOr(input.inputMaxWidth, d.inputMaxWidth), 160, 640));
 
@@ -199,8 +211,13 @@ export function sanitizeGestureConfig(partial?: Partial<GestureConfig>): Gesture
     captureMode,
     delegatePreference,
     targetFps,
+    cameraCaptureResolution,
     inputMaxWidth,
     directVideoFrameGpu:
       typeof input.directVideoFrameGpu === 'boolean' ? input.directVideoFrameGpu : d.directVideoFrameGpu,
+    diagnosticBypassInference:
+      typeof input.diagnosticBypassInference === 'boolean'
+        ? input.diagnosticBypassInference
+        : d.diagnosticBypassInference,
   };
 }

@@ -54,28 +54,28 @@
 
     <section class="panel">
       <div class="panel-title">
-        <span>프레임 / 병목 계측</span>
+        <span>프레임 / 병목 정밀 계측</span>
         <span id="pipelineMeta" class="mono-dim">-</span>
       </div>
       <div class="grid-4">
         <div class="metric-sm">
-          <span class="label">입력 / 처리 FPS (평균)</span>
+          <span class="label">트랙 / 소스 / 수신 / 처리 FPS</span>
           <strong id="fpsStat">-</strong>
         </div>
         <div class="metric-sm">
-          <span class="label">카메라 / 처리 dt (P95)</span>
-          <strong id="dtAvgStat">-</strong>
+          <span class="label">read() 대기 / 호출간격 (ms)</span>
+          <strong id="readStat">-</strong>
         </div>
         <div class="metric-sm">
-          <span class="label">대기 / 복사 / 추론 (ms)</span>
+          <span class="label">MC / 수신→추론 / 추론→수신</span>
+          <strong id="schedStat">-</strong>
+        </div>
+        <div class="metric-sm">
+          <span class="label">복사 / 추론 / 처리dt (ms)</span>
           <strong id="timingStat">-</strong>
         </div>
         <div class="metric-sm">
-          <span class="label">최대 dt / 갭경고</span>
-          <strong id="dtMaxStat">-</strong>
-        </div>
-        <div class="metric-sm">
-          <span class="label">중단 횟수 / 누적</span>
+          <span class="label">최대 dt / 갭 / 중단</span>
           <strong id="stallStat">-</strong>
         </div>
         <div class="metric-sm">
@@ -83,6 +83,7 @@
           <strong id="frameCounts">-</strong>
         </div>
       </div>
+      <div id="cameraCaps" class="mono-dim" style="margin-top: 4px">caps: -</div>
     </section>
 
     <section class="panel">
@@ -153,7 +154,15 @@
           <input type="number" step="100" name="stallThresholdMs" />
         </label>
         <label>
-          입력 최대 너비 (px)
+          카메라 요청 해상도 (재시작 필요)
+          <select name="cameraCaptureResolution">
+            <option value="320x240">320×240 (기본)</option>
+            <option value="640x480">640×480 (표준 MJPG/30fps 테스트)</option>
+            <option value="default">카메라 기본값 (제약 없음)</option>
+          </select>
+        </label>
+        <label>
+          추론 입력 최대 너비 (px)
           <select name="inputMaxWidth">
             <option value="256">256px (고속)</option>
             <option value="320">320px (기본)</option>
@@ -161,7 +170,7 @@
           </select>
         </label>
         <label>
-          목표 FPS
+          목표 FPS (재시작 필요)
           <input type="number" min="10" max="30" step="1" name="targetFps" />
         </label>
         <label>
@@ -177,6 +186,10 @@
             <option value="GPU">GPU (CPU 자동 폴백)</option>
             <option value="CPU">CPU (WASM)</option>
           </select>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" name="diagnosticBypassInference" />
+          진단 모드: 추론 비활성화 — 순수 입력 FPS 측정 (재시작 필요)
         </label>
         <label class="checkbox-label">
           <input type="checkbox" name="directVideoFrameGpu" />

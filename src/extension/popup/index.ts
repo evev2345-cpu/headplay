@@ -1,4 +1,10 @@
-import { CaptureMode, DelegatePreference, GazeMethod, GestureConfig } from '../../core/config/gestureConfig';
+import {
+  CameraCaptureResolution,
+  CaptureMode,
+  DelegatePreference,
+  GazeMethod,
+  GestureConfig,
+} from '../../core/config/gestureConfig';
 import { DiagnosticLogEntry } from '../../core/diagnostics/sessionMetrics';
 import { BackgroundMessage, BackgroundStatusResponse } from '../../shared/messages';
 
@@ -21,11 +27,12 @@ const lastBlinkStatEl = document.getElementById('lastBlinkStat') as HTMLElement;
 
 const pipelineMetaEl = document.getElementById('pipelineMeta') as HTMLElement;
 const fpsStatEl = document.getElementById('fpsStat') as HTMLElement;
-const dtAvgStatEl = document.getElementById('dtAvgStat') as HTMLElement;
-const dtMaxStatEl = document.getElementById('dtMaxStat') as HTMLElement;
+const readStatEl = document.getElementById('readStat') as HTMLElement;
+const schedStatEl = document.getElementById('schedStat') as HTMLElement;
 const stallStatEl = document.getElementById('stallStat') as HTMLElement;
 const timingStatEl = document.getElementById('timingStat') as HTMLElement;
 const frameCountsEl = document.getElementById('frameCounts') as HTMLElement;
+const cameraCapsEl = document.getElementById('cameraCaps') as HTMLElement;
 const currentMarkerEl = document.getElementById('currentMarker') as HTMLElement;
 
 const configForm = document.getElementById('configForm') as HTMLFormElement;
@@ -70,10 +77,12 @@ function populateConfigForm(config: GestureConfig): void {
   setVal('headYawGateEnabled', config.headYawGateEnabled);
   setVal('maxFrameGapMs', config.maxFrameGapMs);
   setVal('stallThresholdMs', config.stallThresholdMs);
+  setVal('cameraCaptureResolution', config.cameraCaptureResolution);
   setVal('inputMaxWidth', config.inputMaxWidth);
   setVal('targetFps', config.targetFps);
   setVal('captureMode', config.captureMode);
   setVal('delegatePreference', config.delegatePreference);
+  setVal('diagnosticBypassInference', config.diagnosticBypassInference);
   setVal('directVideoFrameGpu', config.directVideoFrameGpu);
   setVal('mirrorHorizontal', config.mirrorHorizontal);
   setVal('invertGazeDirection', config.invertGazeDirection);
@@ -140,43 +149,52 @@ function renderStatus(status: BackgroundStatusResponse): void {
     lastBlinkStatEl.textContent = '최근 깜빡임: closed - | openGap -';
     pipelineMetaEl.textContent = 'OFFSCREEN CLOSED';
     fpsStatEl.textContent = '-';
-    dtAvgStatEl.textContent = '-';
-    dtMaxStatEl.textContent = '-';
+    readStatEl.textContent = '-';
+    schedStatEl.textContent = '-';
     stallStatEl.textContent = '-';
     timingStatEl.textContent = '-';
     frameCountsEl.textContent = '-';
+    cameraCapsEl.textContent = 'caps: -';
     currentMarkerEl.textContent = '-';
     renderLogs([]);
     return;
   }
 
-  eyeStateEl.textContent = m.currentEyeState;
+  eyeStateEl.textContent = m.diagnosticBypassInference ? 'BYPASS' : m.currentEyeState;
   blinkScoresEl.textContent = `L:${fmt(m.blinkLeft)} R:${fmt(m.blinkRight)}`;
-  gazeDirEl.textContent = m.gazeSuppressedByHeadTurn ? 'GATED(고개회전)' : m.currentGazeDirection;
+  gazeDirEl.textContent = m.diagnosticBypassInference
+    ? 'BYPASS'
+    : m.gazeSuppressedByHeadTurn
+      ? 'GATED(고개회전)'
+      : m.currentGazeDirection;
   gazeScoresEl.textContent = `sm:${fmt(m.gazeSmoothed)} bs:${fmt(m.gazeRawBlendshape)} ir:${fmt(m.gazeRawIris)}`;
   headYawStatEl.textContent = `yaw:${fmt(m.headYawDeg, 1)}°${m.gazeSuppressedByHeadTurn ? ' [차단]' : ''}`;
-  fsmStateEl.textContent = m.currentFsmState;
+  fsmStateEl.textContent = m.diagnosticBypassInference ? 'DIAG_NO_INFER' : m.currentFsmState;
   earScoresEl.textContent = `EAR L:${fmt(m.earLeft)} R:${fmt(m.earRight)}`;
   blinkSummaryEl.textContent = `짧은:${m.blinkCounts.short} | 긴감김:${m.blinkCounts.long} | 2연속:${m.blinkCounts.doubleBlink} | 명령:${m.blinkCounts.commands}`;
   lastBlinkStatEl.textContent = `최근 깜빡임: closed ${m.lastBlinkClosedMs !== null ? `${m.lastBlinkClosedMs}ms` : '-'} | openGap ${m.lastBlinkOpenGapMs !== null ? `${m.lastBlinkOpenGapMs}ms` : '-'}`;
 
   pipelineMetaEl.textContent = `${m.cameraResolution} | ${m.activeDelegate}`;
-  fpsStatEl.textContent = `${m.cameraInputFps} / ${m.rollingFps} (${fmt(m.avgFps, 1)})`;
-  dtAvgStatEl.textContent = `${fmt(m.avgCameraIntervalMs, 0)} / ${fmt(m.avgDtMs, 1)} (${fmt(m.p95DtMs, 0)})`;
-  dtMaxStatEl.textContent = `${fmt(m.maxDtMs, 0)} ms / ${m.frameGapWarnings}회`;
+  const trackFpsLabel = m.trackReportedFps !== null ? String(m.trackReportedFps) : '?';
+  fpsStatEl.textContent = `t:${trackFpsLabel} s:${fmt(m.sourceFrameFps, 1)} r:${m.cameraInputFps} p:${m.rollingFps}(${fmt(m.avgFps, 1)})`;
+  readStatEl.textContent = `${fmt(m.avgReadWaitMs, 1)} / ${fmt(m.avgReadCallIntervalMs, 1)}`;
+  schedStatEl.textContent = `${fmt(m.avgScheduleDelayMs, 1)} / ${fmt(m.avgReceiveToInferStartMs, 1)} / ${fmt(m.avgInferEndToNextReadResolveMs, 1)}`;
+  timingStatEl.textContent = `${fmt(m.avgBlitMs, 1)} / ${fmt(m.avgInferMs, 1)} / ${fmt(m.avgDtMs, 1)}`;
   stallStatEl.textContent = m.activeStallOngoing
-    ? `진행중(${m.activeStallDurationMs}ms) / 누적 ${m.totalStallMs}ms`
-    : `${m.stallCount}회 / ${m.totalStallMs}ms (최대 ${m.maxStallMs}ms)`;
-  timingStatEl.textContent = `${fmt(m.avgQueueDelayMs, 1)} / ${fmt(m.avgBlitMs, 1)} / ${fmt(m.avgInferMs, 1)}`;
+    ? `진행중(${m.activeStallDurationMs}ms)`
+    : `${fmt(m.maxDtMs, 0)}ms / ${m.frameGapWarnings} / ${m.stallCount}(${m.totalStallMs}ms)`;
   const pathShort =
-    m.inputPath === 'video_frame_zero_copy'
-      ? 'ZC'
-      : m.inputPath === 'canvas_downscale'
-        ? 'CV'
-        : m.inputPath === 'timer_video_canvas'
-          ? 'TM'
-          : '?';
+    m.inputPath === 'bypass_inference'
+      ? 'BYPASS'
+      : m.inputPath === 'video_frame_zero_copy'
+        ? 'ZC'
+        : m.inputPath === 'canvas_downscale'
+          ? 'CV'
+          : m.inputPath === 'timer_video_canvas'
+            ? 'TM'
+            : '?';
   frameCountsEl.textContent = `${m.totalFrames} / ${m.droppedFrames} (${pathShort})`;
+  cameraCapsEl.textContent = `caps: ${m.trackCapabilitiesSummary} | srcΔ:${fmt(m.avgSourceFrameDeltaMs, 1)}ms`;
   currentMarkerEl.textContent = m.currentMarker;
 
   renderLogs(status.logs);
@@ -243,10 +261,14 @@ configForm.addEventListener('submit', (ev) => {
     headYawGateEnabled: (configForm.elements.namedItem('headYawGateEnabled') as HTMLInputElement).checked,
     maxFrameGapMs: num('maxFrameGapMs'),
     stallThresholdMs: num('stallThresholdMs'),
+    cameraCaptureResolution: fd.get('cameraCaptureResolution') as CameraCaptureResolution,
     inputMaxWidth: num('inputMaxWidth'),
     targetFps: num('targetFps'),
     captureMode: fd.get('captureMode') as CaptureMode,
     delegatePreference: fd.get('delegatePreference') as DelegatePreference,
+    diagnosticBypassInference: (
+      configForm.elements.namedItem('diagnosticBypassInference') as HTMLInputElement
+    ).checked,
     directVideoFrameGpu: (configForm.elements.namedItem('directVideoFrameGpu') as HTMLInputElement).checked,
     mirrorHorizontal: (configForm.elements.namedItem('mirrorHorizontal') as HTMLInputElement).checked,
     invertGazeDirection: (configForm.elements.namedItem('invertGazeDirection') as HTMLInputElement).checked,

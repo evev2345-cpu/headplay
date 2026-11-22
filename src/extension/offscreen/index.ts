@@ -87,9 +87,12 @@ async function startTracking(nextConfig: GestureConfig): Promise<{ ok: boolean; 
     fsm.reset();
     metrics.setStallThresholdMs(config.stallThresholdMs);
 
-    const initResult = await tracker.init(config.delegatePreference);
+    const bypassInference = config.diagnosticBypassInference;
+    const initResult = bypassInference
+      ? { activeDelegate: 'BYPASS' as const, fellBackToCpu: false }
+      : await tracker.init(config.delegatePreference);
     const preferDirectVideoFrame =
-      initResult.activeDelegate === 'GPU' && config.directVideoFrameGpu;
+      !bypassInference && initResult.activeDelegate === 'GPU' && config.directVideoFrameGpu;
 
     const startTs = performance.now();
     lastHeartbeatMs = startTs;
@@ -99,6 +102,7 @@ async function startTracking(nextConfig: GestureConfig): Promise<{ ok: boolean; 
       initResult.activeDelegate,
       Date.now(),
       config.stallThresholdMs,
+      bypassInference,
     );
     if (initResult.fellBackToCpu) {
       metrics.recordError('GPU delegate unavailable at startup; using CPU delegate', startTs);
@@ -108,43 +112,89 @@ async function startTracking(nextConfig: GestureConfig): Promise<{ ok: boolean; 
       {
         mode: config.captureMode,
         targetFps: config.targetFps,
+        cameraCaptureResolution: config.cameraCaptureResolution,
         inputMaxWidth: config.inputMaxWidth,
         // Use CPU-optimized 2D canvas readback only when MediaPipe runs on CPU delegate.
         willReadFrequently: initResult.activeDelegate === 'CPU',
         preferDirectVideoFrame,
+        bypassInference,
       },
       {
-        onCameraArrival: (arrivalMs) => {
-          metrics.recordCameraArrival(arrivalMs);
+        onCameraArrival: (telemetry) => {
+          metrics.recordCameraArrival(telemetry);
         },
-        onFrame: ({ source, isDirectVideoFrame, inputPath, timestampMs, queueDelayMs, blitMs }) => {
+        onFrame: ({
+          source,
+          isDirectVideoFrame,
+          inputPath,
+          timestampMs,
+          arrivalMs,
+          scheduleDelayMs,
+          queueDelayMs,
+          blitMs,
+        }) => {
           const procStart = performance.now();
-          const { frame: rawFrame, inferMs } = tracker.detect(source, timestampMs, {
-            isDirectVideoFrame,
-            onDirectVideoFrameUnsupported: () => {
-              capture.setPreferDirectVideoFrame(false);
-              metrics.recordError(
-                'Direct VideoFrame input unsupported on this GPU; switched to canvas copy',
-                timestampMs,
-              );
-            },
-            onFallbackToCpu: () => {
-              capture.setPreferDirectVideoFrame(false);
-              capture.setWillReadFrequently(true);
-              metrics.setActiveDelegate('CPU', timestampMs);
-            },
-          });
+          const receiveToInferStartMs = Math.max(0, procStart - arrivalMs);
 
-          const obs = extractor.extract(rawFrame);
-          const fsmResult = fsm.update(obs);
-          const totalProcessMs = blitMs + (performance.now() - procStart);
-          metrics.recordFrame(obs, fsmResult.state, fsmResult.events, Date.now(), {
-            queueDelayMs,
-            blitMs,
-            inferMs,
-            totalProcessMs,
-            inputPath,
-          });
+          if (bypassInference || source === null) {
+            const inferEndMs = performance.now();
+            const obs = extractor.extract({ timestampMs, faceDetected: false });
+            metrics.recordFrame(obs, fsm.getState(), [], Date.now(), {
+              scheduleDelayMs,
+              queueDelayMs,
+              blitMs: 0,
+              receiveToInferStartMs,
+              inferMs: 0,
+              inferEndMs,
+              totalProcessMs: inferEndMs - procStart,
+              inputPath: 'bypass_inference',
+            });
+          } else {
+            const { frame: rawFrame, inferMs } = tracker.detect(source, timestampMs, {
+              isDirectVideoFrame,
+              onDirectVideoFrameUnsupported: () => {
+                capture.setPreferDirectVideoFrame(false);
+                metrics.recordError(
+                  'Direct VideoFrame input unsupported on this GPU; switched to canvas copy',
+                  timestampMs,
+                );
+              },
+              onFallbackToCpu: () => {
+                capture.setPreferDirectVideoFrame(false);
+                capture.setWillReadFrequently(true);
+                metrics.setActiveDelegate('CPU', timestampMs);
+              },
+            });
+            const inferEndMs = performance.now();
+
+            const obs = extractor.extract(rawFrame);
+            const fsmResult = fsm.update(obs);
+            const totalProcessMs = blitMs + (performance.now() - procStart);
+            metrics.recordFrame(obs, fsmResult.state, fsmResult.events, Date.now(), {
+              scheduleDelayMs,
+              queueDelayMs,
+              blitMs,
+              receiveToInferStartMs,
+              inferMs,
+              inferEndMs,
+              totalProcessMs,
+              inputPath,
+            });
+
+            // Wake background SW only when an actionable gesture command is emitted.
+            for (const ev of fsmResult.events) {
+              if (ev.type === 'GESTURE_COMMAND') {
+                console.info('[HEADPLAY][Phase1] Gesture command:', ev.command, ev.details);
+                notifyBackground({
+                  target: 'background',
+                  type: 'OFFSCREEN_GESTURE_COMMAND',
+                  command: ev.command,
+                  timestampMs: ev.timestampMs,
+                  details: ev.details,
+                });
+              }
+            }
+          }
 
           // Periodic diagnostic heartbeat to verify continuity while Chrome is minimized.
           if (lastHeartbeatMs === 0) {
@@ -152,20 +202,6 @@ async function startTracking(nextConfig: GestureConfig): Promise<{ ok: boolean; 
           } else if (timestampMs - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
             lastHeartbeatMs = timestampMs;
             metrics.recordHeartbeat(timestampMs);
-          }
-
-          // Wake background SW only when an actionable gesture command is emitted.
-          for (const ev of fsmResult.events) {
-            if (ev.type === 'GESTURE_COMMAND') {
-              console.info('[HEADPLAY][Phase1] Gesture command:', ev.command, ev.details);
-              notifyBackground({
-                target: 'background',
-                type: 'OFFSCREEN_GESTURE_COMMAND',
-                command: ev.command,
-                timestampMs: ev.timestampMs,
-                details: ev.details,
-              });
-            }
           }
         },
         onFrameDropped: () => {
@@ -191,13 +227,17 @@ async function startTracking(nextConfig: GestureConfig): Promise<{ ok: boolean; 
       },
     );
 
-    const initialInputPath =
-      startResult.activeMode === 'timer_fallback'
+    const initialInputPath = bypassInference
+      ? 'bypass_inference'
+      : startResult.activeMode === 'timer_fallback'
         ? 'timer_video_canvas'
         : preferDirectVideoFrame && startResult.negotiatedWidth <= config.inputMaxWidth
           ? 'video_frame_zero_copy'
           : 'canvas_downscale';
-    metrics.setCameraInfo(startResult.resolutionLabel, initialInputPath, performance.now());
+    metrics.setCameraInfo(startResult.resolutionLabel, initialInputPath, performance.now(), Date.now(), {
+      trackReportedFps: startResult.negotiatedFps,
+      capabilitiesSummary: startResult.capabilitiesSummary,
+    });
     startWatchdog();
 
     notifyBackground({
@@ -304,9 +344,10 @@ chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse) => {
         metrics.startSession(
           performance.now(),
           capture.getActiveMode(),
-          tracker.getActiveDelegate(),
+          config.diagnosticBypassInference ? 'BYPASS' : tracker.getActiveDelegate(),
           Date.now(),
           config.stallThresholdMs,
+          config.diagnosticBypassInference,
         );
       }
       sendResponse({ ok: true });

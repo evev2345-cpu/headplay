@@ -187,6 +187,104 @@ describe('SessionMetrics', () => {
     expect(blinkLog?.summary).toContain('openGap=110ms');
   });
 
+  it('separates trackReportedFps, sourceFrameFps (VideoFrame.timestamp), appReadFps, reader.read() wait/call intervals, and infer-to-read timings', () => {
+    const baseWall = 1_700_000_000_000;
+    const metrics = new SessionMetrics();
+    metrics.startSession(0, 'track_processor', 'GPU', baseWall, 1000, false);
+    metrics.setCameraInfo('320x240@25fps', 'video_frame_zero_copy', 0, baseWall, {
+      trackReportedFps: 25,
+      capabilitiesSummary: 'w:160..1920, h:120..1080, fps:1..30',
+    });
+
+    // Simulate 5 frames arriving every 120ms (8.33 FPS hardware source), with 118ms readWait, 0.4ms MC schedule, 11.6ms inference
+    for (let i = 0; i < 5; i++) {
+      const readCallStartMs = i * 120 + 2;
+      const readResolveMs = readCallStartMs + 118;
+      const videoFrameTimestampUs = (i + 1) * 120_000;
+      metrics.recordCameraArrival({
+        readCallStartMs,
+        readResolveMs,
+        readWaitMs: 118,
+        readCallIntervalMs: i > 0 ? 120 : null,
+        readToNextReadCallMs: i > 0 ? 2 : null,
+        videoFrameTimestampUs,
+        processorTotalFrames: i + 1,
+        processorDiscardedFrames: 0,
+      });
+
+      const inferEndMs = readResolveMs + 0.5 + 11.6;
+      metrics.recordFrame(obsAt(readResolveMs), 'IDLE', [], baseWall + readResolveMs, {
+        scheduleDelayMs: 0.4,
+        queueDelayMs: 0.5,
+        blitMs: 0,
+        receiveToInferStartMs: 0.5,
+        inferMs: 11.6,
+        inferEndMs,
+        totalProcessMs: 12.1,
+        inputPath: 'video_frame_zero_copy',
+      });
+    }
+
+    const snap = metrics.getSnapshot(600, baseWall + 600);
+    expect(snap.trackReportedFps).toBe(25);
+    expect(snap.trackCapabilitiesSummary).toContain('fps:1..30');
+    expect(snap.avgSourceFrameDeltaMs).toBe(120);
+    expect(snap.sourceFrameFps).toBeCloseTo(8.33, 1);
+    expect(snap.cameraInputFps).toBe(5);
+    expect(snap.avgReadWaitMs).toBe(118);
+    expect(snap.maxReadWaitMs).toBe(118);
+    expect(snap.avgReadCallIntervalMs).toBe(120);
+    expect(snap.avgReadToNextReadCallMs).toBe(2);
+    expect(snap.avgScheduleDelayMs).toBe(0.4);
+    expect(snap.avgReceiveToInferStartMs).toBe(0.5);
+    expect(snap.avgInferMs).toBe(11.6);
+    // Next frame arrives 120ms after previous readResolve, i.e. 120 - 12.1 = 107.9ms after inferEnd
+    expect(snap.avgInferEndToNextReadResolveMs).toBeCloseTo(107.9, 1);
+    expect(snap.processorTotalFrames).toBe(5);
+    expect(snap.processorDiscardedFrames).toBe(0);
+  });
+
+  it('tracks pure input FPS cleanly when diagnosticBypassInference mode is active', () => {
+    const baseWall = 1_700_000_000_000;
+    const metrics = new SessionMetrics();
+    metrics.startSession(0, 'track_processor', 'BYPASS', baseWall, 1000, true);
+    metrics.setCameraInfo('640x480@30fps', 'bypass_inference', 0, baseWall, {
+      trackReportedFps: 30,
+      capabilitiesSummary: 'w:160..1280, h:120..720, fps:1..30',
+    });
+
+    for (let i = 1; i <= 10; i++) {
+      const t = i * 33;
+      metrics.recordCameraArrival({
+        readCallStartMs: t - 32,
+        readResolveMs: t,
+        readWaitMs: 32,
+        readCallIntervalMs: i > 1 ? 33 : null,
+        readToNextReadCallMs: i > 1 ? 1 : null,
+        videoFrameTimestampUs: i * 33_333,
+        processorTotalFrames: i,
+        processorDiscardedFrames: 0,
+      });
+      metrics.recordFrame(obsAt(t), 'IDLE', [], baseWall + t, {
+        scheduleDelayMs: 0.2,
+        queueDelayMs: 0.2,
+        blitMs: 0,
+        receiveToInferStartMs: 0.2,
+        inferMs: 0,
+        inferEndMs: t + 0.3,
+        totalProcessMs: 0.1,
+        inputPath: 'bypass_inference',
+      });
+    }
+
+    const snap = metrics.getSnapshot(330, baseWall + 330);
+    expect(snap.diagnosticBypassInference).toBe(true);
+    expect(snap.activeDelegate).toBe('BYPASS');
+    expect(snap.inputPath).toBe('bypass_inference');
+    expect(snap.avgInferMs).toBe(0);
+    expect(snap.sourceFrameFps).toBeCloseTo(30, 0);
+  });
+
   it('caps log ring buffer to prevent unbounded memory growth', () => {
     const metrics = new SessionMetrics();
     metrics.startSession(0, 'track_processor', 'CPU', 1_700_000_000_000);
