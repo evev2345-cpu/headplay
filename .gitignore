@@ -1,0 +1,6 @@
+node_modules/
+dist/
+assets/models/*.task
+*.log
+.DS_Store
+coverage/

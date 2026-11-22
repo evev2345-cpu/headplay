@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HEADPLAY — 카메라 권한 설정</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        max-width: 560px;
+        margin: 40px auto;
+        padding: 24px;
+        background: #0f172a;
+        color: #f8fafc;
+        line-height: 1.55;
+      }
+      .card {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 24px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 20px;
+      }
+      .notice {
+        background: #0f172a;
+        border-left: 3px solid #38bdf8;
+        padding: 12px;
+        border-radius: 6px;
+        font-size: 13px;
+        margin: 16px 0;
+        color: #cbd5e1;
+      }
+      .warn {
+        border-left-color: #f59e0b;
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 16px;
+      }
+      button {
+        padding: 10px 16px;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+        font-size: 14px;
+      }
+      .primary {
+        background: #22c55e;
+        color: #052e16;
+      }
+      .secondary {
+        background: #334155;
+        color: #f8fafc;
+      }
+      #status {
+        margin-top: 16px;
+        font-size: 13px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: #0f172a;
+        color: #cbd5e1;
+      }
+      #status.ok {
+        color: #86efac;
+        border: 1px solid #16a34a;
+      }
+      #status.err {
+        color: #fca5a5;
+        border: 1px solid #dc2626;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>HEADPLAY — 웹캠 권한 설정 (Phase 1)</h1>
+      <p style="font-size: 14px; color: #94a3b8; margin-top: 0">
+        Chrome MV3 Offscreen 문서는 숨겨진 컨텍스트이므로 권한 팝업을 직접 띄울 수 없습니다. 이 페이지에서 1회 카메라 권한을 허용해 주세요.
+      </p>
+
+      <div class="notice">
+        <strong>개인정보 보호 원칙</strong><br />
+        모든 웹캠 프레임과 눈/시선 추론은 브라우저 내부 로컬(WASM/WebGL)에서만 처리되며, 영상·얼굴·생체 데이터는 외부 서버로 전송되지 않습니다.
+      </div>
+
+      <div class="notice warn">
+        <strong>중요 안내</strong><br />
+        권한 요청 팝업에서 <strong>"항상 허용(Allow while visiting)"</strong> 을 선택해 주세요. "이번만 허용"을 선택하면 이 탭을 닫을 때 Offscreen 문서의 카메라 접근이 중단될 수 있습니다.
+      </div>
+
+      <div class="actions">
+        <button id="requestBtn" class="primary">카메라 권한 요청</button>
+        <button id="startAndCloseBtn" class="secondary" hidden>트래킹 시작 후 이 탭 닫기</button>
+      </div>
+
+      <div id="status">현재 권한 상태 확인 중...</div>
+    </div>
+
+    <script src="permission.js"></script>
+  </body>
+</html>

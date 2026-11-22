@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HEADPLAY Phase 1 Validator</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div>
+        <h1>HEADPLAY <span class="badge-phase">Phase 1</span></h1>
+        <p class="subtitle">로컬 웹캠 눈 깜빡임·시선 백그라운드 기술 검증</p>
+      </div>
+      <span id="statusPill" class="pill pill-idle">IDLE</span>
+    </header>
+
+    <section class="controls">
+      <button id="startBtn" class="btn btn-start">카메라 시작</button>
+      <button id="stopBtn" class="btn btn-stop" disabled>카메라 중지</button>
+      <button id="permBtn" class="btn btn-ghost">권한 설정</button>
+    </section>
+
+    <div id="errorBanner" class="banner banner-err" hidden></div>
+
+    <section class="panel">
+      <div class="panel-title">실시간 인식 상태</div>
+      <div class="grid-3">
+        <div class="metric">
+          <span class="label">눈 상태</span>
+          <strong id="eyeState">-</strong>
+          <small id="blinkScores">L:- R:-</small>
+        </div>
+        <div class="metric">
+          <span class="label">시선 방향</span>
+          <strong id="gazeDir">-</strong>
+          <small id="gazeScores">sm:- bs:- ir:-</small>
+          <small id="headYawStat">yaw:-</small>
+        </div>
+        <div class="metric">
+          <span class="label">FSM 상태</span>
+          <strong id="fsmState">-</strong>
+          <small id="earScores">EAR L:- R:-</small>
+        </div>
+      </div>
+
+      <div class="last-cmd">
+        <span>최근 감지 제스처:</span>
+        <strong id="lastCommand">없음</strong>
+        <small id="blinkSummary">단일:0 | 긴감김:0 | 2연속:0 | 명령:0</small>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">
+        <span>프레임 / 백그라운드 안정성</span>
+        <span id="pipelineMeta" class="mono-dim">-</span>
+      </div>
+      <div class="grid-4">
+        <div class="metric-sm">
+          <span class="label">FPS (현재/평균)</span>
+          <strong id="fpsStat">-</strong>
+        </div>
+        <div class="metric-sm">
+          <span class="label">dt (평균/P95)</span>
+          <strong id="dtAvgStat">-</strong>
+        </div>
+        <div class="metric-sm">
+          <span class="label">최대 dt / 갭경고</span>
+          <strong id="dtMaxStat">-</strong>
+        </div>
+        <div class="metric-sm">
+          <span class="label">중단 횟수 / 누적</span>
+          <strong id="stallStat">-</strong>
+        </div>
+        <div class="metric-sm">
+          <span class="label">변환 / 추론 (ms)</span>
+          <strong id="timingStat">-</strong>
+        </div>
+        <div class="metric-sm">
+          <span class="label">처리 / 드롭</span>
+          <strong id="frameCounts">-</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">
+        <span>환경 마커 (테스트 구간 태깅)</span>
+        <span id="currentMarker" class="mono-dim">-</span>
+      </div>
+      <div class="marker-row">
+        <button class="btn btn-xs marker-btn" data-marker="FOREGROUND_POPUP">팝업 활성</button>
+        <button class="btn btn-xs marker-btn" data-marker="OTHER_TAB_ACTIVE">다른 탭 활성</button>
+        <button class="btn btn-xs marker-btn" data-marker="CHROME_MINIMIZED_TEST">Chrome 최소화</button>
+      </div>
+    </section>
+
+    <details class="panel" id="settingsPanel">
+      <summary class="panel-title clickable">임계값 및 파이프라인 설정</summary>
+      <form id="configForm" class="config-grid">
+        <label>
+          눈 감김 진입 (0.2~0.95)
+          <input type="number" step="0.05" name="blinkCloseThreshold" />
+        </label>
+        <label>
+          눈 뜸 복귀 (0.05~0.9)
+          <input type="number" step="0.05" name="blinkOpenThreshold" />
+        </label>
+        <label>
+          짧은 깜빡임 최대 (ms)
+          <input type="number" step="10" name="maxShortBlinkMs" />
+        </label>
+        <label>
+          긴 눈 감기 최소 (ms)
+          <input type="number" step="20" name="longBlinkMinMs" />
+        </label>
+        <label>
+          긴 눈 감기 최대 (ms)
+          <input type="number" step="50" name="longBlinkMaxMs" />
+        </label>
+        <label>
+          더블 블링크 간격 최대 (ms)
+          <input type="number" step="20" name="doubleBlinkGapMaxMs" />
+        </label>
+        <label>
+          시선 추정 방식
+          <select name="gazeMethod">
+            <option value="hybrid">Hybrid (Blendshape+Iris)</option>
+            <option value="blendshape">Blendshape Only</option>
+            <option value="iris">Iris Landmarks Only</option>
+          </select>
+        </label>
+        <label>
+          시선 진입 임계값
+          <input type="number" step="0.05" name="gazeEnterThreshold" />
+        </label>
+        <label>
+          시선 유지 시간 (ms)
+          <input type="number" step="20" name="gazeHoldMs" />
+        </label>
+        <label>
+          고개 회전 허용각 (deg)
+          <input type="number" step="2" name="headYawMaxDeg" />
+        </label>
+        <label>
+          프레임 간격 리셋 (ms)
+          <input type="number" step="20" name="maxFrameGapMs" />
+        </label>
+        <label>
+          중단 감지 기준 (ms)
+          <input type="number" step="100" name="stallThresholdMs" />
+        </label>
+        <label>
+          캡처 모드 (재시작 필요)
+          <select name="captureMode">
+            <option value="track_processor">MediaStreamTrackProcessor</option>
+            <option value="timer_fallback">Timer Fallback (비교용)</option>
+          </select>
+        </label>
+        <label>
+          추론 Delegate (재시작 필요)
+          <select name="delegatePreference">
+            <option value="GPU">GPU (CPU 자동 폴백)</option>
+            <option value="CPU">CPU (WASM)</option>
+          </select>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" name="headYawGateEnabled" />
+          고개 회전 시 시선 분류 차단 (headYawGateEnabled)
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" name="mirrorHorizontal" />
+          카메라 좌우 반전 보정 (mirrorHorizontal)
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" name="invertGazeDirection" />
+          시선 좌/우 방향 반전 (invertGazeDirection)
+        </label>
+        <div class="config-actions">
+          <button type="submit" class="btn btn-xs btn-start">설정 적용</button>
+          <button type="button" id="resetConfigBtn" class="btn btn-xs btn-ghost">기본값 복원</button>
+        </div>
+      </form>
+    </details>
+
+    <section class="panel">
+      <div class="panel-title">
+        <span>이벤트 로그 (최근)</span>
+        <div class="log-actions">
+          <button id="exportJsonBtn" class="btn btn-xs btn-ghost">JSON</button>
+          <button id="exportCsvBtn" class="btn btn-xs btn-ghost">CSV</button>
+          <button id="clearLogsBtn" class="btn btn-xs btn-ghost">지우기</button>
+        </div>
+      </div>
+      <div id="logList" class="log-list">로그 없음</div>
+    </section>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
