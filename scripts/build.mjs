@@ -185,6 +185,12 @@ async function build() {
       outfile: path.join(distDir, 'popup.js'),
       format: 'iife',
     },
+    {
+      ...common,
+      entryPoints: [path.join(rootDir, 'src/extension/content/youtube.ts')],
+      outfile: path.join(distDir, 'youtube-content.js'),
+      format: 'iife',
+    },
   ];
 
   if (watchMode) {

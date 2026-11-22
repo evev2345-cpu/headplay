@@ -6,6 +6,10 @@ import {
   GestureConfig,
 } from '../../core/config/gestureConfig';
 import { DiagnosticLogEntry } from '../../core/diagnostics/sessionMetrics';
+import {
+  YouTubeControlLogEntry,
+  YouTubeControlStatusSummary,
+} from '../../core/youtube/types';
 import { BackgroundMessage, BackgroundStatusResponse } from '../../shared/messages';
 
 const statusPill = document.getElementById('statusPill') as HTMLSpanElement;
@@ -24,6 +28,11 @@ const earScoresEl = document.getElementById('earScores') as HTMLElement;
 const lastCommandEl = document.getElementById('lastCommand') as HTMLElement;
 const blinkSummaryEl = document.getElementById('blinkSummary') as HTMLElement;
 const lastBlinkStatEl = document.getElementById('lastBlinkStat') as HTMLElement;
+
+const youtubeTabCountsEl = document.getElementById('youtubeTabCounts') as HTMLElement;
+const youtubeLastTargetEl = document.getElementById('youtubeLastTarget') as HTMLElement;
+const youtubeLastExecEl = document.getElementById('youtubeLastExec') as HTMLElement;
+const youtubeLogListEl = document.getElementById('youtubeLogList') as HTMLDivElement;
 
 const pipelineMetaEl = document.getElementById('pipelineMeta') as HTMLElement;
 const fpsStatEl = document.getElementById('fpsStat') as HTMLElement;
@@ -51,6 +60,10 @@ async function sendBg<T = unknown>(msg: BackgroundMessage): Promise<T> {
 
 function fmt(val: number | null | undefined, digits = 2): string {
   return typeof val === 'number' && Number.isFinite(val) ? val.toFixed(digits) : '-';
+}
+
+function truncateText(text: string, maxLen = 42): string {
+  return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
 }
 
 function populateConfigForm(config: GestureConfig): void {
@@ -86,6 +99,59 @@ function populateConfigForm(config: GestureConfig): void {
   setVal('directVideoFrameGpu', config.directVideoFrameGpu);
   setVal('mirrorHorizontal', config.mirrorHorizontal);
   setVal('invertGazeDirection', config.invertGazeDirection);
+}
+
+function renderYouTubeControl(
+  yt: YouTubeControlStatusSummary | undefined,
+  ytLogs: YouTubeControlLogEntry[] | undefined,
+): void {
+  if (!yt) {
+    youtubeTabCountsEl.textContent = '재생:0 / 가능:0 / 전체:0';
+    youtubeLastTargetEl.textContent = '없음';
+    youtubeLastExecEl.textContent = '대기 중';
+  } else {
+    youtubeTabCountsEl.textContent = `재생:${yt.playingTabCount} / 가능:${yt.playableTabCount} / 전체:${yt.trackedTabCount}`;
+    if (yt.lastControlledTabId !== null) {
+      const title = yt.lastControlledTitle ? truncateText(yt.lastControlledTitle) : '-';
+      youtubeLastTargetEl.textContent = `tab#${yt.lastControlledTabId} [${yt.lastControlledPageType ?? '?'}] ${title}`;
+    } else {
+      youtubeLastTargetEl.textContent = '없음';
+    }
+
+    if (yt.lastExecution) {
+      const e = yt.lastExecution;
+      const tabPart = e.tabId !== null ? `tab#${e.tabId}` : 'tab:none';
+      youtubeLastExecEl.textContent = `[${e.commandId}] ${e.command} (${tabPart}) -> ${e.status} (${e.reason}, ${e.windowVisibility})`;
+    } else {
+      youtubeLastExecEl.textContent = '대기 중';
+    }
+  }
+
+  if (!ytLogs || ytLogs.length === 0) {
+    youtubeLogListEl.textContent = 'YouTube 제어 로그 없음';
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  const recent = [...ytLogs].reverse().slice(0, 30);
+  for (const entry of recent) {
+    const row = document.createElement('div');
+    const isFailedOrSkipped =
+      entry.stage === 'YOUTUBE_EXECUTION_RESULT' && entry.data?.status !== 'EXECUTED';
+    row.className = `log-row ${
+      isFailedOrSkipped ? 'log-stage-YOUTUBE_EXECUTION_FAILED' : `log-stage-${entry.stage}`
+    }`;
+    const timeShort = entry.wallTimeIso.slice(11, 23);
+    const stageShort =
+      entry.stage === 'YOUTUBE_COMMAND_RECEIVED'
+        ? 'CMD'
+        : entry.stage === 'YOUTUBE_TARGET_SELECTED'
+          ? 'TARGET'
+          : 'EXEC';
+    row.textContent = `[${timeShort}] [${stageShort}] [${entry.commandId}] ${entry.summary}`;
+    fragment.appendChild(row);
+  }
+  youtubeLogListEl.replaceChildren(fragment);
 }
 
 function renderLogs(logs: DiagnosticLogEntry[]): void {
@@ -131,10 +197,13 @@ function renderStatus(status: BackgroundStatusResponse): void {
 
   if (status.lastCommand) {
     const t = status.lastCommand.wallTimeIso.slice(11, 19);
-    lastCommandEl.textContent = `${status.lastCommand.command} (${t})`;
+    const idPart = status.lastCommand.commandId ? ` [${status.lastCommand.commandId}]` : '';
+    lastCommandEl.textContent = `${status.lastCommand.command} (${t})${idPart}`;
   } else {
     lastCommandEl.textContent = '없음';
   }
+
+  renderYouTubeControl(status.youtubeStatus, status.youtubeLogs);
 
   const m = status.metrics;
   if (!m) {

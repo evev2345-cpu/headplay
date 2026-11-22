@@ -1,18 +1,32 @@
 {
   "manifest_version": 3,
-  "name": "HEADPLAY (Phase 1 — Tech Validation)",
-  "version": "0.1.0",
-  "description": "Local webcam eye blink & gaze recognition validation for Chrome MV3 background/minimized execution.",
+  "name": "HEADPLAY (Phase 2 — YouTube Control)",
+  "version": "0.2.0",
+  "description": "Local webcam eye blink & gaze recognition with background/minimized YouTube playback control.",
   "permissions": [
     "offscreen",
     "storage"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "youtube-content.js"
+      ],
+      "run_at": "document_idle"
+    }
   ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "HEADPLAY Phase 1 Validator",
+    "default_title": "HEADPLAY — Eye Gesture YouTube Control",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

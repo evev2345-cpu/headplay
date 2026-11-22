@@ -327,3 +327,40 @@ details[open] .clickable {
 .log-kind-MARKER {
   color: #fde68a;
 }
+
+.yt-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 6px;
+  font-size: 11px;
+}
+
+.yt-summary strong {
+  color: #e2e8f0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  word-break: break-word;
+}
+
+.log-list-sm {
+  max-height: 110px;
+}
+
+.log-stage-YOUTUBE_COMMAND_RECEIVED {
+  color: #38bdf8;
+}
+
+.log-stage-YOUTUBE_TARGET_SELECTED {
+  color: #fde68a;
+}
+
+.log-stage-YOUTUBE_EXECUTION_RESULT {
+  color: #86efac;
+  font-weight: 600;
+}
+
+.log-stage-YOUTUBE_EXECUTION_FAILED {
+  color: #fca5a5;
+  font-weight: 600;
+}

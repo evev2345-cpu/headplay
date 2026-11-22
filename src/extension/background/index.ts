@@ -13,6 +13,16 @@ import {
   TrackingErrorCode,
   TrackingLifecycleState,
 } from '../../shared/messages';
+import {
+  clearYouTubeBridgeLogs,
+  formatYouTubeLogsCsvRows,
+  getAllYouTubeBridgeLogs,
+  getYouTubeBridgeStatus,
+  handleGestureCommandForYouTube,
+  handleTabRemoved,
+  handleTabUpdated,
+  handleYouTubePlayerEvent,
+} from './youtubeBridge';
 
 const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 const CONFIG_STORAGE_KEY = 'headplay_gesture_config_v1';
@@ -261,10 +271,11 @@ async function stopTracking(): Promise<{ ok: boolean }> {
 }
 
 async function getStatus(logLimit = 120): Promise<BackgroundStatusResponse> {
-  const [config, session, offscreenOpen] = await Promise.all([
+  const [config, session, offscreenOpen, ytState] = await Promise.all([
     loadConfig(),
     loadSessionState(),
     hasOffscreenDocument(),
+    getYouTubeBridgeStatus(logLimit),
   ]);
 
   let lifecycleState = session.lifecycleState;
@@ -305,6 +316,8 @@ async function getStatus(logLimit = 120): Promise<BackgroundStatusResponse> {
     config,
     metrics,
     logs,
+    youtubeStatus: ytState.status,
+    youtubeLogs: ytState.logs,
   };
 }
 
@@ -355,6 +368,14 @@ chrome.windows.onRemoved.addListener(() => {
   void reconcileWindowVisibility('onRemoved');
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  void handleTabUpdated(tabId, changeInfo, tab);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void handleTabRemoved(tabId);
+});
+
 chrome.runtime.onInstalled.addListener(() => {
   void (async () => {
     const existing = await chrome.storage.local.get(CONFIG_STORAGE_KEY);
@@ -369,7 +390,79 @@ chrome.runtime.onStartup.addListener(() => {
   void syncBadge('IDLE');
 });
 
-chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse) => {
+async function buildCombinedExport(
+  format: 'json' | 'csv',
+): Promise<{ ok: boolean; content: string }> {
+  const [offscreenRes, saved, ytStatusObj, ytLogs] = await Promise.all([
+    sendToOffscreen<{ ok: boolean; content: string }>({
+      target: 'offscreen',
+      type: 'OFFSCREEN_EXPORT_LOGS',
+      format,
+    }),
+    loadSavedReport(),
+    getYouTubeBridgeStatus(200),
+    getAllYouTubeBridgeLogs(),
+  ]);
+
+  const baseContent =
+    offscreenRes?.ok && offscreenRes.content
+      ? offscreenRes.content
+      : saved
+        ? format === 'csv'
+          ? saved.csv
+          : saved.json
+        : '';
+
+  if (format === 'json') {
+    if (baseContent) {
+      try {
+        const parsed = JSON.parse(baseContent) as Record<string, unknown>;
+        parsed.youtubeControl = {
+          status: ytStatusObj.status,
+          logs: ytLogs,
+        };
+        return { ok: true, content: JSON.stringify(parsed, null, 2) };
+      } catch {
+        return { ok: true, content: baseContent };
+      }
+    }
+    if (ytLogs.length > 0 || ytStatusObj.status.lastExecution) {
+      return {
+        ok: true,
+        content: JSON.stringify(
+          {
+            exportedAtIso: new Date().toISOString(),
+            metrics: null,
+            logs: [],
+            youtubeControl: {
+              status: ytStatusObj.status,
+              logs: ytLogs,
+            },
+          },
+          null,
+          2,
+        ),
+      };
+    }
+    return { ok: false, content: '' };
+  }
+
+  // CSV format: append YouTube 3-stage audit rows with identical CSV columns
+  const ytRows = formatYouTubeLogsCsvRows(ytLogs);
+  if (baseContent) {
+    const combined = ytRows.length > 0 ? `${baseContent}\n${ytRows.join('\n')}` : baseContent;
+    return { ok: true, content: combined };
+  }
+  if (ytRows.length > 0) {
+    return {
+      ok: true,
+      content: ['id,wallTimeIso,timestampMs,kind,summary,data', ...ytRows].join('\n'),
+    };
+  }
+  return { ok: false, content: '' };
+}
+
+chrome.runtime.onMessage.addListener((raw: unknown, sender, sendResponse) => {
   const msg = raw as BackgroundMessage | undefined;
   if (!msg || msg.target !== 'background') {
     return false;
@@ -439,24 +532,11 @@ chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse) => {
       case 'CLEAR_LOGS':
         await sendToOffscreen({ target: 'offscreen', type: 'OFFSCREEN_CLEAR_LOGS' });
         await chrome.storage.session.remove(LAST_REPORT_STORAGE_KEY);
+        await clearYouTubeBridgeLogs();
         return { ok: true };
 
-      case 'EXPORT_LOGS': {
-        const res = await sendToOffscreen<{ ok: boolean; content: string }>({
-          target: 'offscreen',
-          type: 'OFFSCREEN_EXPORT_LOGS',
-          format: msg.format,
-        });
-        if (res?.ok && res.content) {
-          return res;
-        }
-        const saved = await loadSavedReport();
-        if (saved) {
-          const content = msg.format === 'csv' ? saved.csv : saved.json;
-          return { ok: Boolean(content), content };
-        }
-        return { ok: false, content: '' };
-      }
+      case 'EXPORT_LOGS':
+        return buildCombinedExport(msg.format);
 
       case 'OFFSCREEN_TRACKING_STARTED':
         await updateSessionState({
@@ -483,17 +563,25 @@ chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse) => {
         }
         return { ok: true };
 
+      case 'YOUTUBE_PLAYER_EVENT':
+        await handleYouTubePlayerEvent(sender.tab, msg.eventType, msg.snapshot);
+        return { ok: true };
+
       case 'OFFSCREEN_GESTURE_COMMAND': {
-        // Phase 1: log gesture command only (YouTube control is intentionally out of scope for Phase 1).
+        const { commandId, execution } = await handleGestureCommandForYouTube(
+          msg.command,
+          msg.timestampMs,
+          msg.details,
+        );
         const cmdInfo: LastGestureCommandInfo = {
+          commandId,
           command: msg.command,
           timestampMs: msg.timestampMs,
           wallTimeIso: new Date().toISOString(),
           details: msg.details,
         };
-        console.info('[HEADPLAY][SW][Phase1] Received gesture command:', cmdInfo);
         await updateSessionState({ lastCommand: cmdInfo });
-        return { ok: true };
+        return { ok: execution.status === 'EXECUTED', commandId, execution };
       }
     }
   };

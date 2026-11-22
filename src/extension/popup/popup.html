@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>HEADPLAY Phase 1 Validator</title>
+    <title>HEADPLAY — YouTube Eye Control</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <header class="header">
       <div>
-        <h1>HEADPLAY <span class="badge-phase">Phase 1</span></h1>
-        <p class="subtitle">로컬 웹캠 눈 깜빡임·시선 백그라운드 기술 검증</p>
+        <h1>HEADPLAY <span class="badge-phase">Phase 2</span></h1>
+        <p class="subtitle">로컬 웹캠 눈 제스처 YouTube 백그라운드 제어</p>
       </div>
       <span id="statusPill" class="pill pill-idle">IDLE</span>
     </header>
@@ -50,6 +50,24 @@
         <small id="blinkSummary">단일:0 | 긴감김:0 | 2연속:0 | 명령:0</small>
         <small id="lastBlinkStat">최근 깜빡임: closed - | openGap -</small>
       </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">
+        <span>YouTube 제어 상태</span>
+        <span id="youtubeTabCounts" class="mono-dim">재생:0 / 가능:0 / 전체:0</span>
+      </div>
+      <div class="yt-summary">
+        <div>
+          <span class="label">기억된 대상 탭:</span>
+          <strong id="youtubeLastTarget">없음</strong>
+        </div>
+        <div>
+          <span class="label">최근 실행 결과:</span>
+          <strong id="youtubeLastExec">대기 중</strong>
+        </div>
+      </div>
+      <div id="youtubeLogList" class="log-list log-list-sm">YouTube 제어 로그 없음</div>
     </section>
 
     <section class="panel">

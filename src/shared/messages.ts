@@ -1,6 +1,14 @@
 import { CaptureMode, DelegatePreference, GestureConfig } from '../core/config/gestureConfig';
 import { DiagnosticLogEntry, SessionMetricsSnapshot } from '../core/diagnostics/sessionMetrics';
 import { GestureCommand } from '../core/gesture/gestureStateMachine';
+import {
+  YouTubeControlLogEntry,
+  YouTubeControlStatusSummary,
+  YouTubeExecutionStatus,
+  YouTubePageType,
+  YouTubePlayerSnapshot,
+  YouTubePlayerStateBrief,
+} from '../core/youtube/types';
 
 export type TrackingLifecycleState =
   | 'IDLE'
@@ -19,6 +27,7 @@ export type TrackingErrorCode =
   | 'UNKNOWN';
 
 export interface LastGestureCommandInfo {
+  commandId?: string;
   command: GestureCommand;
   timestampMs: number;
   wallTimeIso: string;
@@ -34,7 +43,16 @@ export interface BackgroundStatusResponse {
   config: GestureConfig;
   metrics: SessionMetricsSnapshot | null;
   logs: DiagnosticLogEntry[];
+  youtubeStatus: YouTubeControlStatusSummary;
+  youtubeLogs: YouTubeControlLogEntry[];
 }
+
+export type YouTubePlayerEventType =
+  | 'MOUNTED'
+  | 'PLAY'
+  | 'PAUSE'
+  | 'ENDED'
+  | 'NAVIGATED';
 
 // Messages sent TO Background Service Worker
 export type BackgroundMessage =
@@ -72,6 +90,12 @@ export type BackgroundMessage =
       command: GestureCommand;
       timestampMs: number;
       details: Record<string, number | string>;
+    }
+  | {
+      target: 'background';
+      type: 'YOUTUBE_PLAYER_EVENT';
+      eventType: YouTubePlayerEventType;
+      snapshot: YouTubePlayerSnapshot;
     };
 
 // Messages sent TO Offscreen Document
@@ -84,7 +108,35 @@ export type OffscreenMessage =
   | { target: 'offscreen'; type: 'OFFSCREEN_CLEAR_LOGS' }
   | { target: 'offscreen'; type: 'OFFSCREEN_EXPORT_LOGS'; format: 'json' | 'csv' };
 
-export type ExtensionMessage = BackgroundMessage | OffscreenMessage;
+// Messages sent TO YouTube Content Script
+export type YouTubeContentMessage =
+  | { target: 'youtube-content'; type: 'YOUTUBE_PROBE_STATE' }
+  | {
+      target: 'youtube-content';
+      type: 'YOUTUBE_EXECUTE_COMMAND';
+      commandId: string;
+      command: GestureCommand;
+    };
+
+export interface YouTubeProbeResponse {
+  ok: boolean;
+  snapshot: YouTubePlayerSnapshot;
+}
+
+export interface YouTubeExecuteResponse {
+  ok: boolean;
+  commandId: string;
+  command: GestureCommand;
+  status: YouTubeExecutionStatus;
+  verified: boolean;
+  reason: string;
+  pageType: YouTubePageType;
+  beforeState: YouTubePlayerStateBrief | null;
+  afterState: YouTubePlayerStateBrief | null;
+  snapshot: YouTubePlayerSnapshot;
+}
+
+export type ExtensionMessage = BackgroundMessage | OffscreenMessage | YouTubeContentMessage;
 
 export interface OffscreenDiagnosticsResponse {
   ok: boolean;
